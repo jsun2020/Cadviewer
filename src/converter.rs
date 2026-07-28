@@ -40,7 +40,6 @@ pub fn convert_to_svg(input: &Path) -> Result<ConvertedDrawing, String> {
 
         let mut command = Command::new(&converter);
         command
-            .arg("-m")
             .arg("-y")
             .arg("-o")
             .arg(&output_path)
