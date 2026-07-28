@@ -1,0 +1,22 @@
+[package]
+name = "cadviewer"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+description = "A minimal, portable DWG viewer and vector PDF converter for Windows"
+repository = "https://github.com/LibreDWG/libredwg"
+
+[dependencies]
+eframe = { version = "0.35.0", default-features = false, features = ["default_fonts", "glow"] }
+resvg = { version = "0.45.1", default-features = true }
+rfd = "0.17.2"
+svg2pdf = "0.13.0"
+tempfile = "3.27.0"
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
+opt-level = 3
+panic = "abort"
+strip = "symbols"
+
