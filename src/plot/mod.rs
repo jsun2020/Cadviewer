@@ -1,5 +1,7 @@
 use crate::geom::PathGeom;
 
+pub mod style;
+
 /// PDF lineweight 0 means "thinnest line the device can draw". AutoCAD uses
 /// it for every hairline entity, and it is the most common width in real
 /// drawings (PRD 3.9.2: 42,134 occurrences in the reference sheet).
