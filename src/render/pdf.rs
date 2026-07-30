@@ -1,6 +1,9 @@
 use std::fmt::Write as _;
+use std::io::Write as _;
 
-use pdf_writer::{Finish, Pdf, Rect, Ref};
+use flate2::Compression;
+use flate2::write::ZlibEncoder;
+use pdf_writer::{Filter, Finish, Pdf, Rect, Ref};
 
 use crate::plot::{PlotItem, PlotScene, Rgb, StrokeStyle};
 
@@ -56,10 +59,27 @@ pub fn write_pdf(scenes: &[PlotScene]) -> Vec<u8> {
         page.finish();
 
         let stream = build_content(scene);
-        pdf.stream(content_ids[i], stream.as_bytes());
+        let compressed = deflate(stream.as_bytes());
+        pdf.stream(content_ids[i], &compressed).filter(Filter::FlateDecode);
     }
 
     pdf.finish()
+}
+
+/// Zlib-compress (RFC 1950) a content stream for `/Filter /FlateDecode`.
+///
+/// Real drawings expand into a content stream with one `m`/`l`/`S` run per
+/// entity (plus per-INSERT block expansion), which is highly repetitive
+/// text; Flate routinely shrinks it 5-10x. Without this, exported PDFs are
+/// gigabytes for drawings AutoCAD itself exports at a few megabytes.
+fn deflate(bytes: &[u8]) -> Vec<u8> {
+    let mut encoder = ZlibEncoder::new(Vec::new(), Compression::best());
+    encoder
+        .write_all(bytes)
+        .expect("writing to an in-memory Vec cannot fail");
+    encoder
+        .finish()
+        .expect("finishing an in-memory Vec encoder cannot fail")
 }
 
 fn build_content(scene: &PlotScene) -> String {
@@ -162,6 +182,10 @@ fn emit_path(out: &mut String, geom: &crate::geom::PathGeom) {
 
 #[cfg(test)]
 mod tests {
+    use std::io::Read as _;
+
+    use flate2::read::ZlibDecoder;
+
     use super::*;
     use crate::geom::{PathGeom, Point, SubPath};
     use crate::plot::{PaperSize, PlotItem, PlotScene, Rgb, StrokeStyle};
@@ -182,6 +206,30 @@ mod tests {
 
     fn content(bytes: &[u8]) -> String {
         String::from_utf8_lossy(bytes).into_owned()
+    }
+
+    fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+        haystack.windows(needle.len()).position(|w| w == needle)
+    }
+
+    /// Locate the (single, in these single-scene tests) content stream
+    /// inside a full PDF document and inflate it back to the operator text
+    /// the state machine produced. Operators are the whole point of this
+    /// module -- a missed graphics-state reset silently applies one
+    /// entity's width/colour/dash to the next -- so tests must keep
+    /// asserting on them directly rather than trusting the compressed
+    /// bytes "look about right".
+    fn decompressed_content(out: &[u8]) -> String {
+        let start_marker = b"stream\n";
+        let end_marker = b"\nendstream";
+        let start = find_bytes(out, start_marker).expect("no stream marker") + start_marker.len();
+        let end = find_bytes(&out[start..], end_marker).expect("no endstream marker") + start;
+        let mut decoder = ZlibDecoder::new(&out[start..end]);
+        let mut text = String::new();
+        decoder
+            .read_to_string(&mut text)
+            .expect("failed to inflate the FlateDecode content stream");
+        text
     }
 
     #[test]
@@ -211,19 +259,25 @@ mod tests {
     fn stroke_width_is_emitted_in_points() {
         // 0.35 mm = 0.9921 pt.
         let out = write_pdf(&[line_scene(0.35)]);
-        assert!(content(&out).contains("0.992"), "expected 0.992 w in the content stream");
+        assert!(
+            decompressed_content(&out).contains("0.992"),
+            "expected 0.992 w in the content stream"
+        );
     }
 
     #[test]
     fn hairline_is_emitted_as_zero_width() {
         let out = write_pdf(&[line_scene(0.0)]);
-        assert!(content(&out).contains("0 w"), "hairline must be '0 w'");
+        assert!(decompressed_content(&out).contains("0 w"), "hairline must be '0 w'");
     }
 
     #[test]
     fn colour_is_emitted_as_a_normalised_rgb_stroke() {
         let out = write_pdf(&[line_scene(0.35)]);
-        assert!(content(&out).contains("1 0 0 RG"), "expected red stroke colour");
+        assert!(
+            decompressed_content(&out).contains("1 0 0 RG"),
+            "expected red stroke colour"
+        );
     }
 
     #[test]
@@ -233,6 +287,46 @@ mod tests {
             style.dash_mm = Some(vec![2.0, 1.0]);
         }
         let out = write_pdf(&[s]);
-        assert!(content(&out).contains(" d\n"), "expected a dash operator");
+        assert!(decompressed_content(&out).contains(" d\n"), "expected a dash operator");
+    }
+
+    #[test]
+    fn content_stream_declares_flate_decode() {
+        let out = write_pdf(&[line_scene(0.35)]);
+        assert!(
+            content(&out).contains("/FlateDecode"),
+            "expected the content stream to declare /Filter /FlateDecode"
+        );
+    }
+
+    #[test]
+    fn flate_compression_shrinks_repetitive_content() {
+        // Real drawings are enormously repetitive (one m/l/S run per
+        // entity, plus per-INSERT block expansion), so this is exactly the
+        // shape of content Flate is expected to shrink drastically -- and
+        // it is what made the uncompressed backend produce a 1 GB PDF from
+        // a 6.5 MB drawing. Assert a substantial ratio, not an exact byte
+        // count, so the test does not become brittle.
+        let mut s = PlotScene::new(PaperSize::a4_landscape());
+        for _ in 0..200 {
+            s.items.push(PlotItem::Path {
+                geom: PathGeom {
+                    subpaths: vec![SubPath {
+                        points: vec![Point::new(10.0, 10.0), Point::new(100.0, 50.0)],
+                        closed: false,
+                    }],
+                },
+                style: StrokeStyle { color: Rgb::new(255, 0, 0), width_mm: 0.35, dash_mm: None },
+            });
+        }
+
+        let raw = build_content(&s);
+        let compressed = deflate(raw.as_bytes());
+        assert!(
+            compressed.len() * 4 < raw.len(),
+            "expected Flate to shrink 200 identical paths by more than 4x: raw {} bytes, compressed {} bytes",
+            raw.len(),
+            compressed.len()
+        );
     }
 }
