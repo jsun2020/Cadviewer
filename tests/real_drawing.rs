@@ -65,3 +65,61 @@ fn parses_the_reference_drawing() {
         .count();
     assert_eq!(frames, 26, "expected 26 title-block inserts (PRD 3.10.1)");
 }
+
+#[test]
+fn detects_twenty_six_sheets_in_reading_order() {
+    let dwg = sample_dwg();
+    if !Path::new(&dwg).exists() {
+        eprintln!("SKIPPED: sample DWG not present at {dwg}");
+        return;
+    }
+    let tmp = std::env::temp_dir().join("cadviewer_sheets.dxf");
+    if !to_dxf(&dwg, &tmp) {
+        eprintln!("SKIPPED: runtime/dwg2dxf.exe unavailable");
+        return;
+    }
+    let bytes = std::fs::read(&tmp).expect("read intermediate DXF");
+    let doc = cadviewer::doc::Document::parse(&bytes).expect("parse");
+    let sheets = cadviewer::sheets::detect(&doc);
+
+    // PRD 3.10.1: 26 title-block inserts in rows of 2/2/1/1/6/6/4/3/1.
+    assert_eq!(sheets.len(), 26, "expected 26 sheets, got {}", sheets.len());
+
+    // Group the detected sheets back into rows and check the shape.
+    let mut rows: Vec<usize> = Vec::new();
+    let mut current_y = f64::NAN;
+    for s in &sheets {
+        if current_y.is_nan() || (current_y - s.bounds.min_y).abs() > s.bounds.height() / 2.0 {
+            rows.push(0);
+            current_y = s.bounds.min_y;
+        }
+        *rows.last_mut().unwrap() += 1;
+    }
+    assert_eq!(rows, vec![2, 2, 1, 1, 6, 6, 4, 3, 1], "row shape mismatch");
+}
+
+#[test]
+fn group_annotation_boxes_never_become_pages() {
+    // PRD 3.10.2: three rectangles on a layer named for plotting enclose
+    // groups of frames. If any survives, pages collapse silently.
+    let dwg = sample_dwg();
+    if !Path::new(&dwg).exists() {
+        eprintln!("SKIPPED: sample DWG not present at {dwg}");
+        return;
+    }
+    let tmp = std::env::temp_dir().join("cadviewer_groups.dxf");
+    if !to_dxf(&dwg, &tmp) {
+        eprintln!("SKIPPED: runtime/dwg2dxf.exe unavailable");
+        return;
+    }
+    let bytes = std::fs::read(&tmp).expect("read intermediate DXF");
+    let doc = cadviewer::doc::Document::parse(&bytes).expect("parse");
+    for s in cadviewer::sheets::detect(&doc) {
+        assert!(
+            s.bounds.width() < 400_000.0,
+            "sheet {} spans {} units; that is a group box, not a frame",
+            s.index,
+            s.bounds.width()
+        );
+    }
+}

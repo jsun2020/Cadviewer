@@ -148,6 +148,112 @@ fn closed_rect_bounds(ent: &crate::dxf::entities::RawEntity) -> Option<Bounds> {
     b.valid().then_some(b)
 }
 
+/// Two nested rectangles this close in size are the inner and outer lines
+/// of one drawn border, not a container and its contents.
+const COINCIDENT_TOLERANCE: f64 = 0.02;
+
+#[derive(Clone, Debug)]
+pub struct Sheet {
+    /// 1-based page number in reading order.
+    pub index: usize,
+    pub bounds: Bounds,
+    pub source: String,
+}
+
+fn nearly_coincident(outer: Bounds, inner: Bounds) -> bool {
+    let ow = outer.width().max(f64::EPSILON);
+    let oh = outer.height().max(f64::EPSILON);
+    (outer.width() - inner.width()).abs() / ow < COINCIDENT_TOLERANCE
+        && (outer.height() - inner.height()).abs() / oh < COINCIDENT_TOLERANCE
+}
+
+/// Drop annotation and grouping rectangles.
+///
+/// A candidate that strictly encloses one or more *distinct* (non-coincident)
+/// candidates is not a real sheet: it is either a group box wrapping several
+/// frames, or a spurious annotation box wrapping one. Keeping the outermost
+/// unconditionally — the intuitive rule — would silently collapse a
+/// 26-sheet drawing into 3 pages (PRD 3.10.2). The one exception is a double
+/// line drawn around the same frame: there the nested rectangles nearly
+/// coincide (within `COINCIDENT_TOLERANCE`), and the outer line is kept as
+/// the sheet while the inner duplicate is suppressed.
+pub fn reject_containers(candidates: Vec<Candidate>) -> Vec<Candidate> {
+    let mut keep = vec![true; candidates.len()];
+
+    for (i, outer) in candidates.iter().enumerate() {
+        let mut enclosed = 0usize;
+        for (j, inner) in candidates.iter().enumerate() {
+            if i == j || !outer.bounds.contains(inner.bounds) {
+                continue;
+            }
+            if nearly_coincident(outer.bounds, inner.bounds) {
+                // Same border drawn twice: suppress the inner copy.
+                keep[j] = false;
+                continue;
+            }
+            enclosed += 1;
+        }
+        if enclosed >= 1 {
+            keep[i] = false;
+        }
+    }
+
+    candidates
+        .into_iter()
+        .zip(keep)
+        .filter_map(|(c, k)| k.then_some(c))
+        .collect()
+}
+
+/// Sort into reading order: rows top to bottom, each row left to right.
+pub fn order_sheets(candidates: Vec<Candidate>) -> Vec<Sheet> {
+    let mut remaining = candidates;
+    remaining.sort_by(|a, b| {
+        b.bounds
+            .min_y
+            .partial_cmp(&a.bounds.min_y)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    let mut rows: Vec<Vec<Candidate>> = Vec::new();
+    for c in remaining {
+        // Same row when the vertical offset is under half the frame height,
+        // which absorbs the jitter real drawings always have.
+        let placed = rows.iter_mut().find(|row| {
+            let reference = &row[0];
+            let tolerance = reference.bounds.height().max(c.bounds.height()) / 2.0;
+            (reference.bounds.min_y - c.bounds.min_y).abs() <= tolerance
+        });
+        match placed {
+            Some(row) => row.push(c),
+            None => rows.push(vec![c]),
+        }
+    }
+
+    let mut out = Vec::new();
+    for row in &mut rows {
+        row.sort_by(|a, b| {
+            a.bounds
+                .min_x
+                .partial_cmp(&b.bounds.min_x)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        for c in row.iter() {
+            out.push(Sheet {
+                index: out.len() + 1,
+                bounds: c.bounds,
+                source: c.source.clone(),
+            });
+        }
+    }
+    out
+}
+
+/// Full detection pipeline: collect, reject containers, order.
+pub fn detect(doc: &Document) -> Vec<Sheet> {
+    order_sheets(reject_containers(collect_candidates(doc)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -212,5 +318,79 @@ mod tests {
         let c = collect_candidates(&doc);
         assert_eq!(c.len(), 1);
         assert_eq!(c[0].signal, Signal::Geometry);
+    }
+
+    fn candidate(min_x: f64, min_y: f64, w: f64, h: f64) -> Candidate {
+        let mut b = Bounds::empty();
+        b.add(Point::new(min_x, min_y));
+        b.add(Point::new(min_x + w, min_y + h));
+        Candidate { bounds: b, signal: Signal::BlockName, source: "F".to_owned() }
+    }
+
+    #[test]
+    fn a_group_box_containing_many_frames_is_discarded() {
+        // PRD 3.10.2: the failure that would collapse 26 pages into 3.
+        let frames: Vec<Candidate> = (0..6)
+            .map(|i| candidate(10.0 + i as f64 * 100.0, 10.0, 80.0, 60.0))
+            .collect();
+        let group = candidate(0.0, 0.0, 620.0, 80.0);
+        let mut all = frames.clone();
+        all.push(group);
+
+        let kept = reject_containers(all);
+        assert_eq!(kept.len(), 6, "the group box must be dropped, got {kept:?}");
+        assert!(kept.iter().all(|c| c.bounds.width() < 100.0));
+    }
+
+    #[test]
+    fn a_double_line_border_keeps_the_outer_rectangle() {
+        let outer = candidate(0.0, 0.0, 420.0, 297.0);
+        let inner = candidate(2.0, 2.0, 416.0, 293.0);
+        let kept = reject_containers(vec![outer, inner]);
+        assert_eq!(kept.len(), 1);
+        assert!((kept[0].bounds.width() - 420.0).abs() < 0.01, "should keep the outer");
+    }
+
+    #[test]
+    fn a_container_holding_only_one_frame_is_still_a_border() {
+        let outer = candidate(0.0, 0.0, 500.0, 400.0);
+        let inner = candidate(10.0, 10.0, 420.0, 297.0);
+        let kept = reject_containers(vec![outer, inner]);
+        assert_eq!(kept.len(), 1, "one nested frame is a border, not a group");
+    }
+
+    #[test]
+    fn sheets_are_ordered_top_to_bottom_then_left_to_right() {
+        // Two rows of two, deliberately supplied out of order.
+        let all = vec![
+            candidate(200.0, 0.0, 100.0, 80.0),
+            candidate(0.0, 200.0, 100.0, 80.0),
+            candidate(200.0, 200.0, 100.0, 80.0),
+            candidate(0.0, 0.0, 100.0, 80.0),
+        ];
+        let sheets = order_sheets(all);
+        assert_eq!(sheets.len(), 4);
+        assert!((sheets[0].bounds.min_x - 0.0).abs() < 0.01, "first should be top-left");
+        assert!((sheets[0].bounds.min_y - 200.0).abs() < 0.01);
+        assert!((sheets[1].bounds.min_x - 200.0).abs() < 0.01, "second should be top-right");
+        assert!((sheets[3].bounds.min_x - 200.0).abs() < 0.01, "last should be bottom-right");
+    }
+
+    #[test]
+    fn rows_tolerate_small_vertical_jitter() {
+        // Frames on the same row are rarely aligned to the micron.
+        let all = vec![
+            candidate(0.0, 0.0, 100.0, 80.0),
+            candidate(200.0, 3.0, 100.0, 80.0),
+        ];
+        let sheets = order_sheets(all);
+        assert!((sheets[0].bounds.min_x - 0.0).abs() < 0.01, "should read left to right");
+        assert!((sheets[1].bounds.min_x - 200.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn sheets_are_indexed_from_one() {
+        let sheets = order_sheets(vec![candidate(0.0, 0.0, 100.0, 80.0)]);
+        assert_eq!(sheets[0].index, 1);
     }
 }
