@@ -1,24 +1,58 @@
 # Cadviewer
 
-Cadviewer 是一个面向 Windows 的极简、便携式 DWG 查看器：
+Cadviewer 是一个面向 Windows 的极简、便携式 DWG 查看器与 PDF 转换器：
 
 - 打开或拖入 `.dwg` / `.dxf`
 - 鼠标滚轮缩放、拖动平移、双击适合窗口
-- 导出保留矢量几何的 PDF
-- 独立轻量命令行转换器：`Cadconvert.exe input.dwg output.pdf`
+- 自动识别模型空间中的图框，一个图框一页，按阅读顺序分页
+- 导出保留矢量几何的多页 PDF，线宽、颜色、线型对标 AutoCAD「打印到 PDF」
+- 彩色 / 单色（等效 monochrome.ctb）一键切换
+- 独立轻量命令行转换器：`Cadconvert.exe input.dwg output.pdf [--mono] [--sheet N]`
 - GUI 也支持命令行转换：`Cadviewer.exe --convert input.dwg output.pdf`
 - 无安装程序、无注册表写入，解压即可运行
 
 ## 技术路线
 
 Cadviewer 使用 [GNU LibreDWG](https://github.com/LibreDWG/libredwg) 的
-`dwg2dxf` 完成 DWG 解码，再在进程内将常见二维 CAD 实体转换为规范 SVG。
-查看器使用 `resvg` 按当前视口栅格化，PDF 则由 `svg2pdf` 直接生成矢量页面。
+`dwg2dxf` 完成 DWG 解码（ASCII DXF），随后在进程内走一条以**纸面毫米**为单位的
+打印管线：
+
+```
+DXF 字节
+  -> encoding      按 $DWGCODEPAGE 逐字符串解码（UTF-8 优先，GBK/Big5 兜底）
+  -> dxf           lexer + 强类型 LAYER / LTYPE / BLOCK / 实体记录
+  -> doc::Document
+  -> sheets        图框识别（块名 -> 图层名 -> 几何启发式三级信号）
+  -> plot          解析颜色 / 线宽 / 线型，展开块，变换到纸面毫米
+  -> PlotScene     所有坐标与宽度均已是毫米
+       |
+       +-- render::skia  屏幕栅格化（tiny-skia）
+       +-- render::pdf   矢量 PDF（pdf-writer，Flate 压缩）
+```
+
+关键设计：**所有打印语义决策只发生在 `plot` 层，两个渲染后端只负责画**。
+屏幕显示与导出 PDF 由同一份 `PlotScene` 产生，结构上不可能不一致。
+
+线宽以毫米存储，因此 0.35 mm 的线在任何缩放比例下打印出来都是 0.35 mm；
+颜色使用精确的 256 项 AutoCAD ACI 查色表（而非近似公式），ACI 7 / 白色在白纸上转为黑色。
 
 当前支持的主要实体包括 LINE、CIRCLE、ARC、ELLIPSE、LWPOLYLINE（含 bulge）、
-POLYLINE、SPLINE、TEXT、MTEXT、POINT、SOLID、TRACE、3DFACE、LEADER、MLINE、
-INSERT/MINSERT、块和常见 DIMENSION 块。三维实体、HATCH、外部参照及部分高级
-R2010+ 对象可能被忽略。
+POLYLINE（含 VERTEX 序列）、SPLINE、POINT、SOLID、TRACE、3DFACE、LEADER、
+INSERT / MINSERT、块递归与 DIMENSION 几何块。
+
+**尚未实现**（见 `prd.md` 与实现计划中的后续阶段）：
+
+- **文字（TEXT / MTEXT / ATTRIB）尚未绘制**——标题栏与标注文字目前为空白
+- HATCH 填充、MLINE、外部参照 XREF、三维实体、代理对象
+- CTB/STB 打印样式表读取、PDF 图层（OCG）
+
+未绘制的实体类型会在警告区按类型与数量列出，不会被静默丢弃。
+
+## 已知限制
+
+- 大图纸导出较慢：26 页的样例图纸约需 9 分钟。原因是块展开尚未按页做包围盒剔除，
+  性能优化属后续阶段。
+- 图幅由图框尺寸按 A 系列 fit 推导，可能与 AutoCAD 当时选用的纸张不同（几何等价）。
 
 ## 开发与构建
 
@@ -33,6 +67,9 @@ cargo build --release
 
 便携包输出到 `dist\Cadviewer-portable-win64`。批处理场景优先使用
 `Cadconvert.exe`，它不会初始化 GUI/OpenGL，启动开销更低。
+
+回归测试中的真实图纸与 AutoCAD 参考件属客户资料，**不入版本库**；
+相关测试在参考件缺失时会明确打印跳过原因，而不会静默通过。
 
 ## 许可证
 
