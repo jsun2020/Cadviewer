@@ -10,4 +10,5 @@ prd.md
 # Reference drawings and AutoCAD-plotted baselines: local only, never committed.
 /tests/reference/
 *.dwg
-*.pdf
+*.pdf/.claude/worktrees/
+/.superpowers/
