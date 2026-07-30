@@ -166,7 +166,10 @@ fn emit(
         }
         let Some(name) = ent.text(2, cp) else { return };
         let Some(block) = doc.blocks.get(&name) else {
-            *report.skipped.entry("INSERT(missing block)".to_owned()).or_default() += 1;
+            *report
+                .skipped
+                .entry(format!("{}(missing block)", ent.kind))
+                .or_default() += 1;
             return;
         };
         let child = Inherited {
