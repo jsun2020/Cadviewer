@@ -19,15 +19,63 @@ const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 pub const DEFAULT_MARGIN_MM: f64 = 10.0;
 
+/// Why a conversion failed, so the CLI can report the exit code R-CLI
+/// specifies (1 input, 2 decode, 3 nothing to print) instead of collapsing
+/// every failure into one number.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FailureKind {
+    Input,
+    Decode,
+    NoContent,
+}
+
+#[derive(Clone, Debug)]
+pub struct ConvertError {
+    pub kind: FailureKind,
+    pub message: String,
+}
+
+impl ConvertError {
+    fn input(message: impl Into<String>) -> Self {
+        Self { kind: FailureKind::Input, message: message.into() }
+    }
+
+    fn decode(message: impl Into<String>) -> Self {
+        Self { kind: FailureKind::Decode, message: message.into() }
+    }
+
+    fn no_content() -> Self {
+        Self {
+            kind: FailureKind::NoContent,
+            message: "图纸中没有可打印的二维实体".to_owned(),
+        }
+    }
+
+    /// The process exit code R-CLI assigns to this failure.
+    pub fn exit_code(&self) -> u8 {
+        match self.kind {
+            FailureKind::Input => 1,
+            FailureKind::Decode => 2,
+            FailureKind::NoContent => 3,
+        }
+    }
+}
+
+impl std::fmt::Display for ConvertError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
 #[derive(Debug)]
 pub struct LoadedDrawing {
     pub doc: Document,
     pub warnings: String,
 }
 
-pub fn load(input: &Path) -> Result<LoadedDrawing, String> {
+pub fn load(input: &Path) -> Result<LoadedDrawing, ConvertError> {
     if !input.exists() {
-        return Err(format!("文件不存在：{}", input.display()));
+        return Err(ConvertError::input(format!("文件不存在：{}", input.display())));
     }
     let extension = input
         .extension()
@@ -37,12 +85,14 @@ pub fn load(input: &Path) -> Result<LoadedDrawing, String> {
 
     let (bytes, warnings, _guard) = match extension.as_str() {
         "dxf" => (
-            fs::read(input).map_err(|error| format!("无法读取 DXF：{error}"))?,
+            fs::read(input)
+                .map_err(|error| ConvertError::input(format!("无法读取 DXF：{error}")))?,
             String::new(),
             None,
         ),
         "dwg" => {
-            let dir = tempfile::tempdir().map_err(|error| format!("无法创建临时目录：{error}"))?;
+            let dir = tempfile::tempdir()
+                .map_err(|error| ConvertError::input(format!("无法创建临时目录：{error}")))?;
             let out = dir.path().join("drawing.dxf");
             let converter = locate_converter()?;
 
@@ -66,7 +116,7 @@ pub fn load(input: &Path) -> Result<LoadedDrawing, String> {
 
             let output = command
                 .output()
-                .map_err(|error| format!("无法启动 LibreDWG：{error}"))?;
+                .map_err(|error| ConvertError::decode(format!("无法启动 LibreDWG：{error}")))?;
             let warnings = String::from_utf8_lossy(&output.stderr).trim().to_owned();
             if !output.status.success() || !out.exists() {
                 let stdout = String::from_utf8_lossy(&output.stdout);
@@ -75,20 +125,21 @@ pub fn load(input: &Path) -> Result<LoadedDrawing, String> {
                 } else {
                     warnings.as_str()
                 };
-                return Err(format!(
+                return Err(ConvertError::decode(format!(
                     "LibreDWG 转换失败（退出码 {}）{}{}",
                     output.status.code().unwrap_or(-1),
                     if detail.is_empty() { "" } else { "：" },
                     detail
-                ));
+                )));
             }
-            let bytes = fs::read(&out).map_err(|error| format!("无法读取中间 DXF：{error}"))?;
+            let bytes = fs::read(&out)
+                .map_err(|error| ConvertError::decode(format!("无法读取中间 DXF：{error}")))?;
             (bytes, warnings, Some(dir))
         }
-        _ => return Err("仅支持 .dwg 和 .dxf 文件".to_owned()),
+        _ => return Err(ConvertError::input("仅支持 .dwg 和 .dxf 文件")),
     };
 
-    let doc = Document::parse(&bytes)?;
+    let doc = Document::parse(&bytes).map_err(ConvertError::decode)?;
     Ok(LoadedDrawing { doc, warnings })
 }
 
@@ -96,10 +147,13 @@ pub fn load(input: &Path) -> Result<LoadedDrawing, String> {
 /// so what is on screen and what is exported can never drift apart.
 ///
 /// Phase 3 replaces this with one scene per detected sheet.
-pub fn build_scene(doc: &Document, mode: ColorMode) -> Result<(PlotScene, BuildReport), String> {
+pub fn build_scene(
+    doc: &Document,
+    mode: ColorMode,
+) -> Result<(PlotScene, BuildReport), ConvertError> {
     let window = model_extents(doc);
     if !window.valid() {
-        return Err("图纸中没有可打印的二维实体".to_owned());
+        return Err(ConvertError::no_content());
     }
     let request = PlotRequest {
         window,
@@ -109,7 +163,7 @@ pub fn build_scene(doc: &Document, mode: ColorMode) -> Result<(PlotScene, BuildR
     };
     let (scene, report) = build(doc, &request);
     if scene.items.is_empty() {
-        return Err("图纸中没有可打印的二维实体".to_owned());
+        return Err(ConvertError::no_content());
     }
     Ok((scene, report))
 }
@@ -132,14 +186,17 @@ impl Default for ConvertOptions {
 /// Paper size and plot scale come from the frame's own dimensions fitted to
 /// a standard sheet. The title block's printed scale text is deliberately
 /// ignored: it records the drawing scale, not the plot scale (PRD 3.10.3).
-pub fn scenes_for(doc: &Document, options: &ConvertOptions) -> Result<Vec<PlotScene>, String> {
+pub fn scenes_for(
+    doc: &Document,
+    options: &ConvertOptions,
+) -> Result<Vec<PlotScene>, ConvertError> {
     let mut sheets = detect(doc);
 
     if sheets.is_empty() {
         // R-SHEET-6: never fail, fall back to the whole model space.
         let window = model_extents(doc);
         if !window.valid() {
-            return Err("图纸中没有可打印的二维实体".to_owned());
+            return Err(ConvertError::no_content());
         }
         let req = PlotRequest {
             window,
@@ -155,7 +212,9 @@ pub fn scenes_for(doc: &Document, options: &ConvertOptions) -> Result<Vec<PlotSc
         let total = sheets.len();
         sheets.retain(|s| s.index == index);
         if sheets.is_empty() {
-            return Err(format!("图纸编号 {index} 超出范围（共 {total} 张）"));
+            return Err(ConvertError::input(format!(
+                "图纸编号 {index} 超出范围（共 {total} 张）"
+            )));
         }
     }
 
@@ -188,15 +247,16 @@ pub fn convert_to_pdf(
     input: &Path,
     output: &Path,
     options: &ConvertOptions,
-) -> Result<usize, String> {
+) -> Result<usize, ConvertError> {
     let loaded = load(input)?;
     let scenes = scenes_for(&loaded.doc, options)?;
     let bytes = write_pdf(&scenes);
-    fs::write(output, bytes).map_err(|e| format!("无法写入 PDF：{e}"))?;
+    fs::write(output, bytes)
+        .map_err(|e| ConvertError::input(format!("无法写入 PDF：{e}")))?;
     Ok(scenes.len())
 }
 
-fn locate_converter() -> Result<PathBuf, String> {
+fn locate_converter() -> Result<PathBuf, ConvertError> {
     let mut candidates = Vec::new();
 
     if let Some(custom) = std::env::var_os("CADVIEWER_LIBREDWG") {
@@ -222,7 +282,9 @@ fn locate_converter() -> Result<PathBuf, String> {
     candidates
         .into_iter()
         .find(|candidate| candidate.is_file())
-        .ok_or_else(|| "缺少 runtime\\dwg2dxf.exe。请重新解压完整的 Cadviewer 便携包。".to_owned())
+        .ok_or_else(|| {
+            ConvertError::input("缺少 runtime\\dwg2dxf.exe。请重新解压完整的 Cadviewer 便携包。")
+        })
 }
 
 #[cfg(test)]
@@ -243,12 +305,28 @@ mod tests {
     fn build_scene_rejects_a_drawing_with_no_drawable_entities() {
         let src = b"  0\nSECTION\n  2\nENTITIES\n  0\n3DSOLID\n  8\n0\n  0\nENDSEC\n  0\nEOF\n";
         let doc = Document::parse(src).unwrap();
-        assert!(build_scene(&doc, ColorMode::Color).is_err());
+        let error = build_scene(&doc, ColorMode::Color).unwrap_err();
+        assert_eq!(
+            error.exit_code(),
+            3,
+            "R-CLI: nothing printable is exit code 3, not the generic 1"
+        );
+    }
+
+    #[test]
+    fn a_corrupt_file_is_reported_as_a_decode_failure() {
+        // A .dxf whose group codes cannot be read at all.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("broken.dxf");
+        fs::write(&path, b"not a group code\nat all\n").unwrap();
+        let error = load(&path).unwrap_err();
+        assert_eq!(error.exit_code(), 2, "R-CLI: a decode failure is exit code 2");
     }
 
     #[test]
     fn unsupported_extensions_are_rejected_before_any_work() {
         let error = load(Path::new("Cargo.toml")).unwrap_err();
-        assert!(error.contains("dwg"), "unexpected error: {error}");
+        assert!(error.message.contains("dwg"), "unexpected error: {error}");
+        assert_eq!(error.exit_code(), 1, "R-CLI: a bad input is exit code 1");
     }
 }

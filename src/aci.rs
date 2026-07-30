@@ -9,11 +9,6 @@
 /// test module, which reads a reference PDF when one is available.
 pub const ACI_TABLE: [(u8, u8, u8); 256] = build_table();
 
-/// Documents the hue count baked into `build_table`'s slot arithmetic
-/// (240 non-fixed indices / 10 shades each = 24 hues); not read directly.
-#[allow(dead_code)]
-const HUE_STEPS: usize = 24;
-
 /// Brightness levels applied to each hue, as (high, low) channel byte pairs.
 /// `high` is the dominant channel, `low` is the channel that stays dark.
 const LEVELS: [(u8, u8); 5] = [(255, 0), (165, 0), (127, 0), (76, 0), (38, 0)];

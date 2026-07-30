@@ -52,7 +52,9 @@ fn main() -> eframe::Result {
 
 fn convert_file(input: &Path, output: &Path) -> Result<(), String> {
     let options = converter::ConvertOptions::default();
-    converter::convert_to_pdf(input, output, &options).map(|_pages| ())
+    converter::convert_to_pdf(input, output, &options)
+        .map(|_pages| ())
+        .map_err(|error| error.to_string())
 }
 
 fn show_error(message: &str) {
@@ -288,7 +290,8 @@ impl CadviewerApp {
         let sender = self.sender.clone();
         let context = context.clone();
         std::thread::spawn(move || {
-            let result = converter::convert_to_pdf(&source, &path, &options);
+            let result = converter::convert_to_pdf(&source, &path, &options)
+                .map_err(|error| error.to_string());
             let _ = sender.send(AppMessage::Exported { path, result });
             context.request_repaint();
         });
@@ -727,7 +730,7 @@ impl eframe::App for CadviewerApp {
 }
 
 fn load_document(path: &Path, mode: ColorMode) -> Result<LoadedDocument, String> {
-    let loaded = converter::load(path)?;
+    let loaded = converter::load(path).map_err(|error| error.to_string())?;
     let doc = loaded.doc;
     let sheets = cadviewer::sheets::detect(&doc);
     let request = sheet_request(&doc, &sheets, 0, mode)
