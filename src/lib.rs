@@ -1,6 +1,7 @@
 pub mod aci;
 pub mod converter;
 pub mod dxf;
+pub mod dxfnew;
 pub mod encoding;
 pub mod fonts;
 pub mod geom;
