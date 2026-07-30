@@ -81,12 +81,19 @@ In `Cargo.toml`, replace the `[dependencies]` block with:
 eframe = { version = "0.35.0", default-features = false, features = ["default_fonts", "glow"] }
 encoding_rs = "0.8"
 pdf-writer = "0.12"
+resvg = { version = "0.45.1", default-features = true }
 rfd = "0.17.2"
+svg2pdf = "0.13.0"
 tempfile = "3.27.0"
 tiny-skia = "0.11"
 ```
 
-`resvg` and `svg2pdf` are intentionally gone. `src/pdf.rs` and `src/dxf.rs` still reference them, so the build will break until Task 16. That is expected and acceptable — Phase 1 tasks are validated by `cargo test --lib` on the new modules only, using the command given in each task.
+**`resvg` and `svg2pdf` stay for now, and are removed in Task 16.** The old `src/main.rs` and `src/pdf.rs` still use them, so dropping them here would break compilation of the whole crate — and a crate that does not compile cannot run `cargo test --lib` for *any* module, including the new ones. Every task from here to Task 16 must leave `cargo build` green.
+
+Verify that before continuing:
+
+Run: `cargo build --offline 2>&1 | Select-String -Pattern "^error|Finished"`
+Expected: `Finished`.
 
 - [ ] **Step 2: Write the failing test**
 
@@ -3814,10 +3821,22 @@ fn locate_converter() -> Result<PathBuf, String> {
 }
 ```
 
-- [ ] **Step 2: Delete the SVG core and update the module list**
+- [ ] **Step 2: Delete the SVG core, drop its dependencies, update the module list**
 
 ```bash
 git rm src/dxf.rs src/pdf.rs
+```
+
+Now remove the two lines Task 1 deliberately kept, so `[dependencies]` in `Cargo.toml` reads exactly:
+
+```toml
+[dependencies]
+eframe = { version = "0.35.0", default-features = false, features = ["default_fonts", "glow"] }
+encoding_rs = "0.8"
+pdf-writer = "0.12"
+rfd = "0.17.2"
+tempfile = "3.27.0"
+tiny-skia = "0.11"
 ```
 
 Set `src/lib.rs` to exactly:
