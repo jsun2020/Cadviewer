@@ -16,7 +16,12 @@ impl Value {
             Value::I16(v) => Some(*v as f64),
             Value::I32(v) => Some(*v as f64),
             Value::I64(v) => Some(*v as f64),
-            Value::Str(b) => core::str::from_utf8(b).ok()?.trim().parse().ok(),
+            Value::Str(b) => core::str::from_utf8(b)
+                .ok()?
+                .trim()
+                .parse::<f64>()
+                .ok()
+                .filter(|v| v.is_finite()),
         }
     }
 
@@ -156,7 +161,7 @@ fn lex_binary(mut b: &[u8]) -> Result<Vec<Pair>, String> {
                 }
                 let v = f64::from_le_bytes(b[..8].try_into().unwrap());
                 b = &b[8..];
-                Value::F64(v)
+                Value::F64(finite(v))
             }
             Kind::I16 => {
                 if b.len() < 2 {
@@ -191,8 +196,7 @@ fn lex_binary(mut b: &[u8]) -> Result<Vec<Pair>, String> {
 fn lex_ascii(bytes: &[u8]) -> Result<Vec<Pair>, String> {
     let mut out = Vec::new();
     let mut lines = bytes.split(|c| *c == b'\n');
-    loop {
-        let Some(code_line) = lines.next() else { break };
+    while let Some(code_line) = lines.next() {
         let code_text = core::str::from_utf8(strip_cr(code_line))
             .map_err(|_| "non-ASCII DXF group code".to_owned())?;
         let trimmed = code_text.trim();
@@ -208,7 +212,7 @@ fn lex_ascii(bytes: &[u8]) -> Result<Vec<Pair>, String> {
             // ASCII DXF spells a binary chunk as one line of hex-digit
             // text, so it needs no special-case reading here.
             Kind::Str | Kind::Chunk => Value::Str(raw.to_vec()),
-            Kind::F64 => Value::F64(parse_ascii(raw).unwrap_or(0.0)),
+            Kind::F64 => Value::F64(finite(parse_ascii(raw).unwrap_or(0.0))),
             Kind::Bool | Kind::I16 => Value::I16(parse_ascii::<f64>(raw).unwrap_or(0.0) as i16),
             Kind::I32 => Value::I32(parse_ascii::<f64>(raw).unwrap_or(0.0) as i32),
             Kind::I64 => Value::I64(parse_ascii::<f64>(raw).unwrap_or(0.0) as i64),
@@ -216,6 +220,19 @@ fn lex_ascii(bytes: &[u8]) -> Result<Vec<Pair>, String> {
         out.push(Pair { code, value });
     }
     Ok(out)
+}
+
+/// Clamp a non-finite real to zero at the point it enters the document.
+///
+/// Rust's `f64` parser returns `inf` — not `Err` — for an overflowing
+/// literal such as `1e400`, and a binary DXF can carry any bit pattern at
+/// all. A non-finite coordinate, radius or angle has no geometric meaning,
+/// and one reaching angle normalisation downstream used to spin forever
+/// (an `inf` sweep can never be brought into range by adding turns to it).
+/// Guarding here means every consumer of a group-code value is covered by
+/// a single clamp.
+fn finite(v: f64) -> f64 {
+    if v.is_finite() { v } else { 0.0 }
 }
 
 fn strip_cr(line: &[u8]) -> &[u8] {
@@ -312,6 +329,39 @@ mod tests {
         assert_eq!(pairs[0].value.as_i32(), Some(1));
         assert_eq!(pairs[1].code, 0);
         assert_eq!(pairs[1].value.as_bytes(), Some(&b"SECTION"[..]));
+    }
+
+    /// Regression test for the hang C1 describes: `"1e400".parse::<f64>()`
+    /// succeeds and yields `inf`, so an overflowing literal used to enter
+    /// the document as a real coordinate. Downstream angle normalisation
+    /// then loops forever. Every real-valued group code must be finite by
+    /// the time it leaves the lexer, whichever spelling produced it.
+    #[test]
+    fn overflowing_and_infinite_reals_are_clamped_to_zero() {
+        let src = b" 10\n1e400\n 20\ninf\n 30\n-inf\n 40\nNaN\n 41\n1.5\n";
+        let pairs = lex(src).expect("lex should succeed");
+        for p in &pairs[..4] {
+            assert_eq!(
+                p.value.as_f64(),
+                Some(0.0),
+                "code {} kept a non-finite value: {:?}",
+                p.code,
+                p.value
+            );
+        }
+        assert_eq!(pairs[4].value.as_f64(), Some(1.5), "sane values must survive");
+    }
+
+    /// The same guard on the binary path, where any 8 bytes can decode to
+    /// an infinity without anything having to parse them.
+    #[test]
+    fn binary_non_finite_reals_are_clamped_to_zero() {
+        let mut v = Vec::new();
+        v.extend_from_slice(b"AutoCAD Binary DXF\r\n\x1a\x00");
+        v.extend_from_slice(&10u16.to_le_bytes());
+        v.extend_from_slice(&f64::INFINITY.to_le_bytes());
+        let pairs = lex(&v).expect("lex should succeed");
+        assert_eq!(pairs[0].value.as_f64(), Some(0.0));
     }
 
     /// Regression test for the real-drawing bug: a group-310 binary chunk
