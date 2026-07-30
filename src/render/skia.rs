@@ -11,6 +11,10 @@ fn paint_for(color: Rgb) -> Paint<'static> {
     paint
 }
 
+/// Colour of the area around the sheet in the viewer, matching the app's
+/// central panel so the sheet reads as paper on a desk.
+pub const DESK_RGB: (u8, u8, u8) = (29, 33, 40);
+
 /// Rasterise a scene at the given zoom. `pixels_per_mm` is the only view
 /// parameter: panning is done by the caller cropping or offsetting the
 /// resulting pixmap.
@@ -19,7 +23,48 @@ pub fn render(scene: &PlotScene, pixels_per_mm: f32) -> Pixmap {
     let h = (scene.paper.height_mm as f32 * pixels_per_mm).ceil().max(1.0) as u32;
     let mut pixmap = Pixmap::new(w, h).unwrap_or_else(|| Pixmap::new(1, 1).unwrap());
     pixmap.fill(Color::WHITE);
+    draw_into(&mut pixmap, scene, pixels_per_mm, 0.0, 0.0);
+    pixmap
+}
 
+/// Rasterise only the `width` x `height` pixel window whose top-left corner
+/// sits at `(origin_x, origin_y)` in the pixel space a full-page [`render`]
+/// at the same zoom would produce (so y grows downwards).
+///
+/// The viewer needs this because a full-page raster is not an option at
+/// interactive zoom: an A0 sheet at 200x fit would be a quarter of a million
+/// pixels wide. Rendering only the visible window keeps the cost tied to the
+/// window size, exactly as the previous resvg-based viewport did.
+pub fn render_window(
+    scene: &PlotScene,
+    pixels_per_mm: f32,
+    origin_x: f32,
+    origin_y: f32,
+    width: u32,
+    height: u32,
+) -> Option<Pixmap> {
+    let mut pixmap = Pixmap::new(width.max(1), height.max(1))?;
+    pixmap.fill(Color::from_rgba8(DESK_RGB.0, DESK_RGB.1, DESK_RGB.2, 255));
+
+    let sheet_w = scene.paper.width_mm as f32 * pixels_per_mm;
+    let sheet_h = scene.paper.height_mm as f32 * pixels_per_mm;
+    if let Some(sheet) = tiny_skia::Rect::from_xywh(-origin_x, -origin_y, sheet_w, sheet_h) {
+        let mut paint = Paint::default();
+        paint.set_color(Color::WHITE);
+        pixmap.fill_rect(sheet, &paint, Transform::identity(), None);
+    }
+
+    draw_into(&mut pixmap, scene, pixels_per_mm, origin_x, origin_y);
+    Some(pixmap)
+}
+
+fn draw_into(
+    pixmap: &mut Pixmap,
+    scene: &PlotScene,
+    pixels_per_mm: f32,
+    origin_x: f32,
+    origin_y: f32,
+) {
     // Scene Y runs up from the bottom-left (PDF convention); pixmaps run
     // down from the top-left, so flip here rather than in plot::build.
     let transform = Transform::from_row(
@@ -27,8 +72,8 @@ pub fn render(scene: &PlotScene, pixels_per_mm: f32) -> Pixmap {
         0.0,
         0.0,
         -pixels_per_mm,
-        0.0,
-        scene.paper.height_mm as f32 * pixels_per_mm,
+        -origin_x,
+        scene.paper.height_mm as f32 * pixels_per_mm - origin_y,
     );
 
     for item in &scene.items {
@@ -62,7 +107,6 @@ pub fn render(scene: &PlotScene, pixels_per_mm: f32) -> Pixmap {
             }
         }
     }
-    pixmap
 }
 
 fn build_path(geom: &crate::geom::PathGeom) -> Option<tiny_skia::Path> {
@@ -166,5 +210,73 @@ mod tests {
              rows: {dark_rows:?}",
             h * 9 / 10
         );
+    }
+
+    /// First non-white row down the middle column. Scanning one column rather
+    /// than the whole width keeps the desk border out of the answer.
+    fn marked_row(pm: &tiny_skia::Pixmap) -> Option<u32> {
+        let x = pm.width() / 2;
+        (0..pm.height()).find(|y| pm.pixel(x, *y).map(|p| p.red() < 250).unwrap_or(false))
+    }
+
+    fn assert_near(actual: Option<u32>, expected: u32) {
+        let actual = actual.expect("nothing was drawn in the middle column");
+        // A one-pixel stroke centred on a pixel boundary marks the row above
+        // it too, so allow a pixel of slack.
+        assert!(
+            actual.abs_diff(expected) <= 1,
+            "expected the mark near row {expected}, found it at {actual}"
+        );
+    }
+
+    #[test]
+    fn a_window_has_exactly_the_requested_pixel_size() {
+        let pm = render_window(&scene_with(0.5), 4.0, 120.0, 60.0, 300, 180).unwrap();
+        assert_eq!((pm.width(), pm.height()), (300, 180));
+    }
+
+    #[test]
+    fn an_unshifted_window_matches_the_full_page_render() {
+        // The line sits 50 mm up a 100 mm sheet, so at 2 px/mm it lands on
+        // pixel row 100 in both.
+        let scene = scene_with(0.5);
+        assert_near(marked_row(&render(&scene, 2.0)), 100);
+        assert_near(
+            marked_row(&render_window(&scene, 2.0, 0.0, 0.0, 200, 200).unwrap()),
+            100,
+        );
+    }
+
+    #[test]
+    fn shifting_the_origin_pans_the_content() {
+        // Moving the window 40 px down the sheet moves the mark 40 px up in
+        // the window. Without the origin offset it would stay at row 100.
+        let pm = render_window(&scene_with(0.5), 2.0, 0.0, 40.0, 200, 200).unwrap();
+        assert_near(marked_row(&pm), 60);
+    }
+
+    #[test]
+    fn shifting_the_origin_pans_horizontally_too() {
+        // The line spans x = 10..90 mm, so a window starting 30 px in sees it
+        // begin at column 20 - 30 = -10, i.e. from the very first column.
+        let marked_col = |pm: &tiny_skia::Pixmap, y: u32| -> Option<u32> {
+            (0..pm.width()).find(|x| pm.pixel(*x, y).map(|p| p.red() < 250).unwrap_or(false))
+        };
+        let scene = scene_with(0.5);
+        let unshifted = render_window(&scene, 2.0, 0.0, 0.0, 200, 200).unwrap();
+        let shifted = render_window(&scene, 2.0, 30.0, 0.0, 200, 200).unwrap();
+        assert_eq!(marked_col(&unshifted, 100), Some(20));
+        assert_eq!(marked_col(&shifted, 100), Some(0));
+    }
+
+    #[test]
+    fn the_area_outside_the_sheet_is_desk_not_paper() {
+        // A 100 mm sheet at 2 px/mm covers 200 px; ask for 260 and the last
+        // 60 columns must be desk-coloured.
+        let pm = render_window(&scene_with(0.5), 2.0, 0.0, 0.0, 260, 200).unwrap();
+        let inside = pm.pixel(10, 10).unwrap();
+        let outside = pm.pixel(250, 10).unwrap();
+        assert_eq!((inside.red(), inside.green(), inside.blue()), (255, 255, 255));
+        assert_eq!((outside.red(), outside.green(), outside.blue()), (29, 33, 40));
     }
 }

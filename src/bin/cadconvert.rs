@@ -1,19 +1,35 @@
-use cadviewer::{converter, pdf};
-use std::path::Path;
+use std::path::PathBuf;
+use std::process::ExitCode;
 
-fn main() {
-    let args: Vec<_> = std::env::args_os().skip(1).collect();
-    if args.len() != 2 {
-        eprintln!("Usage: Cadconvert.exe <input.dwg|input.dxf> <output.pdf>");
-        std::process::exit(2);
-    }
+use cadviewer::converter::convert_to_pdf;
+use cadviewer::plot::style::ColorMode;
 
-    let input = Path::new(&args[0]);
-    let output = Path::new(&args[1]);
-    let result = converter::convert_to_svg(input)
-        .and_then(|converted| pdf::svg_to_pdf(&converted.pdf_svg, output));
-    if let Err(error) = result {
-        eprintln!("Cadconvert: {error}");
-        std::process::exit(1);
+const USAGE: &str = "用法：Cadconvert.exe <input.dwg|input.dxf> <output.pdf> [--mono]";
+
+fn main() -> ExitCode {
+    let mut args = std::env::args_os().skip(1);
+    let Some(input) = args.next() else {
+        eprintln!("{USAGE}");
+        return ExitCode::from(2);
+    };
+    let Some(output) = args.next() else {
+        eprintln!("{USAGE}");
+        return ExitCode::from(2);
+    };
+    let mode = if args.any(|arg| arg == "--mono") {
+        ColorMode::Monochrome
+    } else {
+        ColorMode::Color
+    };
+
+    match convert_to_pdf(&PathBuf::from(input), &PathBuf::from(output), mode) {
+        Ok(pages) => {
+            println!("已导出 {pages} 页");
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("错误：{error}");
+            ExitCode::from(1)
+        }
     }
 }

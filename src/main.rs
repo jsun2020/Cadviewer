@@ -1,8 +1,11 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use cadviewer::{converter, fonts, pdf};
+use cadviewer::converter;
+use cadviewer::doc::Document;
+use cadviewer::plot::PlotScene;
+use cadviewer::plot::style::ColorMode;
+use cadviewer::render::{pdf::write_pdf, skia};
 use eframe::egui;
-use resvg::tiny_skia;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -46,8 +49,7 @@ fn main() -> eframe::Result {
 }
 
 fn convert_file(input: &Path, output: &Path) -> Result<(), String> {
-    let converted = converter::convert_to_svg(input)?;
-    pdf::svg_to_pdf(&converted.pdf_svg, output)
+    converter::convert_to_pdf(input, output, ColorMode::Color).map(|_pages| ())
 }
 
 fn show_error(message: &str) {
@@ -60,9 +62,11 @@ fn show_error(message: &str) {
 
 struct LoadedDocument {
     source: PathBuf,
-    pdf_svg: Arc<String>,
-    tree: Arc<resvg::usvg::Tree>,
-    entity_count: usize,
+    /// Kept for Phase 3, which re-plots the same document once per detected
+    /// sheet instead of once for the whole model.
+    doc: Arc<Document>,
+    scene: Arc<PlotScene>,
+    item_count: usize,
     warnings: String,
 }
 
@@ -79,7 +83,11 @@ struct CadviewerApp {
     receiver: Receiver<AppMessage>,
     document: Option<LoadedDocument>,
     texture: Option<egui::TextureHandle>,
+    /// Sheet point under the middle of the viewport, in millimetres measured
+    /// from the top-left corner of the paper (y grows downwards, matching
+    /// screen space so the pan maths below is a plain subtraction).
     center: egui::Pos2,
+    /// Logical screen pixels per sheet millimetre.
     zoom: f32,
     fit_zoom: f32,
     view_size: egui::Vec2,
@@ -139,11 +147,15 @@ impl CadviewerApp {
         };
         self.exporting = true;
         self.status = format!("正在生成 {}…", file_name(&path));
-        let svg = Arc::clone(&document.pdf_svg);
+        let scene = Arc::clone(&document.scene);
         let sender = self.sender.clone();
         let context = context.clone();
         std::thread::spawn(move || {
-            let result = pdf::svg_to_pdf(&svg, &path);
+            // Export exactly the scene on screen, so the PDF can never drift
+            // from the preview.
+            let bytes = write_pdf(std::slice::from_ref(scene.as_ref()));
+            let result = std::fs::write(&path, bytes)
+                .map_err(|error| format!("无法写入 PDF：{error}"));
             let _ = sender.send(AppMessage::Exported { path, result });
             context.request_repaint();
         });
@@ -159,9 +171,10 @@ impl CadviewerApp {
                             let title = format!("{} — Cadviewer", file_name(&document.source));
                             context.send_viewport_cmd(egui::ViewportCommand::Title(title));
                             self.status = format!(
-                                "{} · {} 个二维图元{}",
+                                "{} · {} 个实体 · {} 个图元{}",
                                 file_name(&document.source),
-                                document.entity_count,
+                                document.doc.entities.len(),
+                                document.item_count,
                                 if document.warnings.is_empty() {
                                     ""
                                 } else {
@@ -237,9 +250,9 @@ impl CadviewerApp {
         if self.view_size.x <= 1.0 || self.view_size.y <= 1.0 {
             return;
         }
-        let size = document.tree.size();
-        let width = size.width().max(1.0);
-        let height = size.height().max(1.0);
+        let paper = document.scene.paper;
+        let width = (paper.width_mm as f32).max(1.0);
+        let height = (paper.height_mm as f32).max(1.0);
         self.fit_zoom = (self.view_size.x / width).min(self.view_size.y / height) * 0.94;
         self.zoom = self.fit_zoom.max(0.000_001);
         self.center = egui::pos2(width * 0.5, height * 0.5);
@@ -274,18 +287,27 @@ impl CadviewerApp {
         let render_scale = ppp * cap_factor;
         let width = (canvas.width() * render_scale).round().max(1.0) as u32;
         let height = (canvas.height() * render_scale).round().max(1.0) as u32;
-        let Some(mut pixmap) = tiny_skia::Pixmap::new(width, height) else {
+
+        // Pixels per sheet millimetre for this frame, and the top-left of the
+        // visible window in the full-sheet pixel grid at that resolution.
+        let pixels_per_mm = self.zoom * render_scale;
+        let origin_x = self.center.x * pixels_per_mm - width as f32 * 0.5;
+        let origin_y = self.center.y * pixels_per_mm - height as f32 * 0.5;
+
+        let Some(pixmap) = skia::render_window(
+            &document.scene,
+            pixels_per_mm,
+            origin_x,
+            origin_y,
+            width,
+            height,
+        ) else {
             self.status = "无法分配渲染缓冲区".to_owned();
             return;
         };
-        pixmap.fill(tiny_skia::Color::from_rgba8(32, 40, 48, 255));
 
-        let scale = self.zoom * render_scale;
-        let tx = width as f32 * 0.5 - self.center.x * scale;
-        let ty = height as f32 * 0.5 - self.center.y * scale;
-        let transform = tiny_skia::Transform::from_row(scale, 0.0, 0.0, scale, tx, ty);
-        resvg::render(&document.tree, transform, &mut pixmap.as_mut());
-
+        // tiny-skia pixmaps are premultiplied; every pixel here is opaque
+        // because the window is filled before anything is drawn.
         let image = egui::ColorImage::from_rgba_premultiplied(
             [width as usize, height as usize],
             pixmap.data(),
@@ -459,17 +481,14 @@ impl eframe::App for CadviewerApp {
 }
 
 fn load_document(path: &Path) -> Result<LoadedDocument, String> {
-    let converted = converter::convert_to_svg(path)?;
-    let mut options = resvg::usvg::Options::default();
-    fonts::configure(&mut options, &converted.svg);
-    let tree = resvg::usvg::Tree::from_str(&converted.svg, &options)
-        .map_err(|error| format!("无法构建二维场景：{error}"))?;
+    let loaded = converter::load(path)?;
+    let (scene, report) = converter::build_scene(&loaded.doc, ColorMode::Color)?;
     Ok(LoadedDocument {
         source: path.to_owned(),
-        pdf_svg: Arc::new(converted.pdf_svg),
-        tree: Arc::new(tree),
-        entity_count: converted.entity_count,
-        warnings: converted.warnings,
+        doc: Arc::new(loaded.doc),
+        scene: Arc::new(scene),
+        item_count: report.items,
+        warnings: loaded.warnings,
     })
 }
 
