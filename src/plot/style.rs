@@ -1,6 +1,9 @@
+use std::collections::HashMap;
+
 use crate::aci::aci_rgb;
 use crate::dxfnew::entities::RawEntity;
-use crate::dxfnew::tables::LayerRecord;
+use crate::dxfnew::tables::{LayerRecord, LtypeRecord};
+use crate::encoding::Codepage;
 use crate::plot::Rgb;
 use crate::plot::{DEFAULT_WIDTH_MM, HAIRLINE_MM};
 
@@ -157,6 +160,66 @@ fn hundredths_to_mm(raw: i16) -> f32 {
         0 => HAIRLINE_MM,
         v if v > 0 => v as f32 / 100.0,
         _ => DEFAULT_WIDTH_MM,
+    }
+}
+
+/// Resolve one entity's dash pattern, already converted to plotted
+/// millimetres.
+///
+/// AutoCAD itself explodes linetypes into individual segments and emits no
+/// PDF dash operator at all (PRD 3.9.4). We use native PDF dashes instead:
+/// visually equivalent and dramatically smaller output. R-LT-5 records this
+/// as a deliberate deviation that the visual-diff harness must confirm.
+pub fn resolve_dash_mm(
+    entity: &RawEntity,
+    layer: Option<&LayerRecord>,
+    ltypes: &HashMap<String, LtypeRecord>,
+    inherited_ltype: &str,
+    ltscale: f64,
+    plot_scale: f64,
+    cp: Codepage,
+) -> Option<Vec<f32>> {
+    let name = linetype_name(entity, layer, inherited_ltype, cp);
+    let record = ltypes.get(&name)?;
+    if record.pattern.is_empty() {
+        return None;
+    }
+
+    let celtscale = {
+        let v = entity.f64(48, 1.0);
+        if v > 0.0 { v } else { 1.0 }
+    };
+    let factor = ltscale.abs().max(f64::EPSILON) * celtscale * plot_scale;
+
+    let dashes: Vec<f32> = record
+        .pattern
+        .iter()
+        .map(|v| (v.abs() * factor) as f32)
+        .collect();
+
+    // A pattern whose lengths all round to zero would render as an
+    // invisible line rather than a dashed one.
+    if dashes.iter().all(|v| *v <= f32::EPSILON) {
+        return None;
+    }
+    Some(dashes)
+}
+
+fn linetype_name(
+    entity: &RawEntity,
+    layer: Option<&LayerRecord>,
+    inherited_ltype: &str,
+    cp: Codepage,
+) -> String {
+    let raw = entity
+        .text(6, cp)
+        .unwrap_or_else(|| "BYLAYER".to_owned());
+    match raw.to_ascii_uppercase().as_str() {
+        "BYLAYER" => layer
+            .map(|l| l.linetype.clone())
+            .unwrap_or_else(|| "CONTINUOUS".to_owned()),
+        "BYBLOCK" => inherited_ltype.to_owned(),
+        _ => raw,
     }
 }
 
@@ -323,5 +386,99 @@ mod tests {
                 "370={raw} gave {got} mm, expected {expected} mm"
             );
         }
+    }
+
+    use crate::dxfnew::tables::LtypeRecord;
+    use std::collections::HashMap;
+
+    fn ltypes() -> HashMap<String, LtypeRecord> {
+        let mut m = HashMap::new();
+        m.insert(
+            "HIDDEN".to_owned(),
+            LtypeRecord { name: "HIDDEN".to_owned(), pattern: vec![6.35, -3.175] },
+        );
+        m.insert(
+            "CONTINUOUS".to_owned(),
+            LtypeRecord { name: "CONTINUOUS".to_owned(), pattern: vec![] },
+        );
+        m
+    }
+
+    fn entity_with(codes: &[(i32, i32)], strings: &[(i32, &str)]) -> RawEntity {
+        let mut e = entity(codes);
+        for (c, s) in strings {
+            e.codes.push((*c, Value::Str(s.as_bytes().to_vec())));
+        }
+        e
+    }
+
+    #[test]
+    fn solid_linetypes_produce_no_dash_pattern() {
+        let e = entity_with(&[], &[(6, "CONTINUOUS")]);
+        let got = resolve_dash_mm(
+            &e, Some(&layer(7, None)), &ltypes(), "CONTINUOUS", 1.0, 1.0, Codepage::Latin1,
+        );
+        assert_eq!(got, None);
+    }
+
+    #[test]
+    fn dash_lengths_are_scaled_into_millimetres() {
+        // 6.35 drawing units * LTSCALE 10 * plot scale 0.01 mm/unit = 0.635 mm
+        let e = entity_with(&[], &[(6, "HIDDEN")]);
+        let got = resolve_dash_mm(
+            &e, Some(&layer(7, None)), &ltypes(), "CONTINUOUS", 10.0, 0.01, Codepage::Latin1,
+        )
+        .expect("HIDDEN should dash");
+        assert!((got[0] - 0.635).abs() < 1e-4, "got {got:?}");
+        assert!((got[1] - 0.3175).abs() < 1e-4, "got {got:?}");
+    }
+
+    #[test]
+    fn gaps_become_positive_lengths() {
+        // PDF dash arrays alternate on/off as positive numbers; the DXF
+        // sign convention (negative = gap) must not leak through.
+        let e = entity_with(&[], &[(6, "HIDDEN")]);
+        let got = resolve_dash_mm(
+            &e, Some(&layer(7, None)), &ltypes(), "CONTINUOUS", 1.0, 1.0, Codepage::Latin1,
+        )
+        .unwrap();
+        assert!(got.iter().all(|v| *v >= 0.0), "got {got:?}");
+    }
+
+    #[test]
+    fn celtscale_multiplies_the_pattern() {
+        let e = entity_with(&[(48, 2)], &[(6, "HIDDEN")]);
+        let got = resolve_dash_mm(
+            &e, Some(&layer(7, None)), &ltypes(), "CONTINUOUS", 1.0, 1.0, Codepage::Latin1,
+        )
+        .unwrap();
+        assert!((got[0] - 12.70).abs() < 1e-4, "got {got:?}");
+    }
+
+    #[test]
+    fn bylayer_linetype_is_taken_from_the_layer() {
+        let mut l = layer(7, None);
+        l.linetype = "HIDDEN".to_owned();
+        let e = entity_with(&[], &[(6, "BYLAYER")]);
+        let got = resolve_dash_mm(
+            &e, Some(&l), &ltypes(), "CONTINUOUS", 1.0, 1.0, Codepage::Latin1,
+        );
+        assert!(got.is_some(), "should have inherited HIDDEN from the layer");
+    }
+
+    #[test]
+    fn degenerate_patterns_do_not_produce_an_invisible_line() {
+        // An all-zero pattern would make a PDF dash array that renders
+        // nothing at all. Treat it as solid.
+        let mut m = ltypes();
+        m.insert(
+            "ZERO".to_owned(),
+            LtypeRecord { name: "ZERO".to_owned(), pattern: vec![0.0, 0.0] },
+        );
+        let e = entity_with(&[], &[(6, "ZERO")]);
+        let got = resolve_dash_mm(
+            &e, Some(&layer(7, None)), &m, "CONTINUOUS", 1.0, 1.0, Codepage::Latin1,
+        );
+        assert_eq!(got, None);
     }
 }
