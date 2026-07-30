@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use crate::dxf::entities::{RawEntity, read_blocks, read_section};
+use crate::dxf::entities::{BlockRecord, RawEntity, read_blocks, read_section};
 use crate::dxf::lexer::lex;
 use crate::dxf::tables::{
     HeaderVars, LayerRecord, LtypeRecord, read_header, read_layers, read_ltypes,
@@ -11,7 +11,7 @@ pub struct Document {
     pub header: HeaderVars,
     pub layers: HashMap<String, LayerRecord>,
     pub ltypes: HashMap<String, LtypeRecord>,
-    pub blocks: HashMap<String, Vec<RawEntity>>,
+    pub blocks: HashMap<String, BlockRecord>,
     /// Model-space and paper-space entities from the ENTITIES section only.
     /// Block bodies live in `blocks` and are reached through INSERT.
     pub entities: Vec<RawEntity>,
@@ -48,7 +48,7 @@ mod tests {
         let d = Document::parse(SRC).expect("parse should succeed");
         assert_eq!(d.header.codepage, Codepage::Gbk);
         assert_eq!(d.layers["WALL"].lineweight, 35);
-        assert_eq!(d.blocks["FRAME"].len(), 1);
+        assert_eq!(d.blocks["FRAME"].entities.len(), 1);
         assert_eq!(d.entities.len(), 2);
     }
 

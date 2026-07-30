@@ -56,6 +56,10 @@ pub fn write_pdf(scenes: &[PlotScene]) -> Vec<u8> {
             mm(scene.paper.height_mm),
         ));
         page.contents(content_ids[i]);
+        // /Resources is a required inheritable page attribute (PDF 1.7
+        // 7.7.3.3). Viewers tolerate its absence; strict preflight and
+        // PDF/A do not, and nothing in /Pages supplies it.
+        page.resources();
         page.finish();
 
         let stream = build_content(scene);
@@ -92,6 +96,22 @@ fn build_content(scene: &PlotScene) -> String {
     // Butt caps and mitre joins match AutoCAD's plotted geometry.
     let _ = writeln!(out, "0 J 0 j 4 M");
 
+    // Clip to the printable area. AutoCAD clips at the plot window, and the
+    // builder's cull can only drop entities lying *entirely* off the paper:
+    // one that straddles the frame edge is emitted whole and would
+    // otherwise be inked across this page's margin.
+    let clipped = scene.clip.filter(|c| c.valid() && c.width() > 0.0 && c.height() > 0.0);
+    if let Some(area) = clipped {
+        let _ = writeln!(
+            out,
+            "q {:.3} {:.3} {:.3} {:.3} re W n",
+            mm(area.min_x),
+            mm(area.min_y),
+            mm(area.width()),
+            mm(area.height())
+        );
+    }
+
     for item in &scene.items {
         match item {
             PlotItem::Path { geom, style } => {
@@ -114,6 +134,10 @@ fn build_content(scene: &PlotScene) -> String {
                 let _ = writeln!(out, "f");
             }
         }
+    }
+
+    if clipped.is_some() {
+        let _ = writeln!(out, "Q");
     }
 
     out
@@ -288,6 +312,38 @@ mod tests {
         }
         let out = write_pdf(&[s]);
         assert!(decompressed_content(&out).contains(" d\n"), "expected a dash operator");
+    }
+
+    /// I8: without a clip, an entity that straddles the frame edge — the
+    /// neighbouring sheet on a tiled model space — is emitted whole and
+    /// inked across this page's margin. AutoCAD clips at the plot window.
+    #[test]
+    fn the_printable_area_is_clipped() {
+        let mut s = line_scene(0.35);
+        let mut area = crate::geom::Bounds::empty();
+        area.add(Point::new(10.0, 10.0));
+        area.add(Point::new(287.0, 200.0));
+        s.clip = Some(area);
+        let text = decompressed_content(&write_pdf(&[s]));
+        assert!(text.contains(" re W n"), "no clip path in {text}");
+        assert!(text.trim_end().ends_with('Q'), "the clip is never closed: {text}");
+        // 10 mm = 28.346 pt, and the area is 277 x 190 mm.
+        assert!(text.contains("28.346 28.346"), "clip origin missing from {text}");
+    }
+
+    #[test]
+    fn a_scene_without_a_clip_emits_no_clip_operators() {
+        let text = decompressed_content(&write_pdf(&[line_scene(0.35)]));
+        assert!(!text.contains(" W n"), "unexpected clip in {text}");
+    }
+
+    #[test]
+    fn every_page_declares_a_resource_dictionary() {
+        let out = write_pdf(&[line_scene(0.35)]);
+        assert!(
+            content(&out).contains("/Resources"),
+            "PDF 1.7 7.7.3.3 makes /Resources a required page attribute"
+        );
     }
 
     #[test]

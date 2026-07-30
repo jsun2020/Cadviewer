@@ -67,8 +67,11 @@ pub fn resolve_color(
 }
 
 fn entity_color(entity: &RawEntity, layer: Option<&LayerRecord>, inherited: Rgb) -> Rgb {
-    let true_color = entity.int(420, 0);
-    if true_color > 0 {
+    // Presence of code 420 is what matters, not its value: true-colour
+    // black is 0x000000, and testing `> 0` sends an entity explicitly
+    // painted black down the ByLayer path instead.
+    let true_color = entity.int(420, -1);
+    if true_color >= 0 {
         return truecolor_to_rgb(true_color as u32);
     }
 
@@ -113,9 +116,23 @@ pub fn resolve_width_mm(
     inherited_lw: i16,
     celweight: i16,
 ) -> f32 {
+    hundredths_to_mm(resolve_raw_width(entity, layer, inherited_lw, celweight))
+}
+
+/// The same resolution as [`resolve_width_mm`], stopping at the raw
+/// hundredths-of-a-millimetre value.
+///
+/// An INSERT needs this: what its children inherit for "ByBlock" is the
+/// width the INSERT itself *resolves to*, not the sentinel its group code
+/// happens to hold.
+pub fn resolve_raw_width(
+    entity: &RawEntity,
+    layer: Option<&LayerRecord>,
+    inherited_lw: i16,
+    celweight: i16,
+) -> i16 {
     let entity_lw = entity.int(370, LW_BYLAYER as i32) as i16;
-    let resolved = resolve_raw(entity_lw, layer, inherited_lw, celweight);
-    hundredths_to_mm(resolved)
+    resolve_raw(entity_lw, layer, inherited_lw, celweight)
 }
 
 fn resolve_raw(
@@ -130,29 +147,38 @@ fn resolve_raw(
             if layer_lw >= 0 { layer_lw } else { fallback(celweight) }
         }
         LW_BYBLOCK => {
-            if inherited_lw >= 0 {
+            if resolved(inherited_lw) {
                 inherited_lw
             } else {
                 let layer_lw = layer.map(|l| l.lineweight).unwrap_or(LW_DEFAULT);
                 if layer_lw >= 0 { layer_lw } else { fallback(celweight) }
             }
         }
-        LW_DEFAULT => {
-            let layer_lw = layer.map(|l| l.lineweight).unwrap_or(LW_DEFAULT);
-            if layer_lw >= 0 { layer_lw } else { fallback(celweight) }
-        }
+        // R-LW-1 spells the chain as 370 -> ByLayer -> ByBlock -> Default
+        // takes $CELWEIGHT -> 0.25 mm. "Default" therefore does NOT consult
+        // the layer: in AutoCAD an entity lineweight of Default resolves to
+        // the LWDEFAULT system variable, which is what $CELWEIGHT carries
+        // here. Reading the layer first made an entity explicitly set to
+        // Default plot at its layer's width instead.
+        LW_DEFAULT => fallback(celweight),
         explicit => explicit,
     }
 }
 
+/// Sentinel meaning "use DEFAULT_WIDTH_MM". -100 cannot collide with a real
+/// 1/100 mm value because those are non-negative here.
+const LW_FALLBACK: i16 = -100;
+
+/// True for a value that has already been resolved to a plottable width,
+/// including the "fell all the way through" sentinel. A child inheriting
+/// ByBlock must accept the latter too, or it restarts the chain from its
+/// own layer and lands somewhere the INSERT never specified.
+fn resolved(lw: i16) -> bool {
+    lw >= 0 || lw == LW_FALLBACK
+}
+
 fn fallback(celweight: i16) -> i16 {
-    if celweight >= 0 {
-        celweight
-    } else {
-        // Sentinel meaning "use DEFAULT_WIDTH_MM"; -100 cannot collide with
-        // a real 1/100 mm value because those are non-negative here.
-        -100
-    }
+    if celweight >= 0 { celweight } else { LW_FALLBACK }
 }
 
 fn hundredths_to_mm(raw: i16) -> f32 {
@@ -179,7 +205,7 @@ pub fn resolve_dash_mm(
     plot_scale: f64,
     cp: Codepage,
 ) -> Option<Vec<f32>> {
-    let name = linetype_name(entity, layer, inherited_ltype, cp);
+    let name = resolve_linetype_name(entity, layer, inherited_ltype, cp);
     let record = ltypes.get(&name)?;
     if record.pattern.is_empty() {
         return None;
@@ -205,7 +231,14 @@ pub fn resolve_dash_mm(
     Some(dashes)
 }
 
-fn linetype_name(
+/// The linetype name an entity actually plots with, upper-cased.
+///
+/// Names are case-insensitive in AutoCAD, and the LTYPE table is keyed the
+/// same way ([`crate::dxf::tables::read_ltypes`]), so an entity spelling it
+/// `hidden` still finds `HIDDEN` rather than silently rendering solid.
+/// Public because an INSERT must hand its *resolved* name down to children
+/// that say ByBlock, not the raw group code it happens to carry.
+pub fn resolve_linetype_name(
     entity: &RawEntity,
     layer: Option<&LayerRecord>,
     inherited_ltype: &str,
@@ -213,12 +246,13 @@ fn linetype_name(
 ) -> String {
     let raw = entity
         .text(6, cp)
-        .unwrap_or_else(|| "BYLAYER".to_owned());
-    match raw.to_ascii_uppercase().as_str() {
+        .unwrap_or_else(|| "BYLAYER".to_owned())
+        .to_ascii_uppercase();
+    match raw.as_str() {
         "BYLAYER" => layer
-            .map(|l| l.linetype.clone())
+            .map(|l| l.linetype.to_ascii_uppercase())
             .unwrap_or_else(|| "CONTINUOUS".to_owned()),
-        "BYBLOCK" => inherited_ltype.to_owned(),
+        "BYBLOCK" => inherited_ltype.to_ascii_uppercase(),
         _ => raw,
     }
 }
@@ -244,6 +278,9 @@ mod tests {
             true_color,
             lineweight: -3,
             linetype: "CONTINUOUS".to_owned(),
+            off: false,
+            frozen: false,
+            plottable: true,
         }
     }
 
@@ -350,6 +387,63 @@ mod tests {
         l.lineweight = -3;
         let e = entity(&[(370, -3)]);
         assert_eq!(resolve_width_mm(&e, Some(&l), -3, -3), DEFAULT_WIDTH_MM);
+    }
+
+    /// I3: R-LW-1 sends "Default" (-3) straight to `$CELWEIGHT`, never via
+    /// the layer — in AutoCAD an entity lineweight of Default resolves to
+    /// the LWDEFAULT system variable. The two existing Default tests both
+    /// use a layer that is itself -3, so neither can tell the chains apart;
+    /// this one puts a real width on the layer to force the distinction.
+    #[test]
+    fn default_ignores_the_layer_and_goes_to_celweight() {
+        let mut l = layer(7, None);
+        l.lineweight = 100;
+        let e = entity(&[(370, -3)]);
+        assert_eq!(
+            resolve_width_mm(&e, Some(&l), -3, 15),
+            0.15,
+            "Default must take $CELWEIGHT, not the layer's 1.00 mm"
+        );
+        assert_eq!(
+            resolve_width_mm(&e, Some(&l), -3, -3),
+            DEFAULT_WIDTH_MM,
+            "with no $CELWEIGHT it falls to the 0.25 mm floor, still not the layer"
+        );
+    }
+
+    /// I2 at the unit level: a child inheriting a width its parent resolved
+    /// all the way down to the fallback must keep it, not restart the chain
+    /// from its own layer.
+    #[test]
+    fn byblock_keeps_an_inherited_fallback_width() {
+        let mut l = layer(7, None);
+        l.lineweight = 100;
+        let e = entity(&[(370, -2)]);
+        let inherited = resolve_raw_width(&entity(&[(370, -3)]), None, -3, -3);
+        assert_eq!(resolve_width_mm(&e, Some(&l), inherited, -3), DEFAULT_WIDTH_MM);
+    }
+
+    /// Minor 5: linetype names are case-insensitive in AutoCAD, so an
+    /// entity naming `hidden` must find the `HIDDEN` table record instead
+    /// of silently rendering solid.
+    #[test]
+    fn linetype_lookup_ignores_case() {
+        let e = entity_with(&[], &[(6, "hidden")]);
+        let got = resolve_dash_mm(
+            &e, Some(&layer(7, None)), &ltypes(), "CONTINUOUS", 1.0, 1.0, Codepage::Latin1,
+        );
+        assert!(got.is_some(), "lower-case name must still find HIDDEN");
+    }
+
+    /// Minor 4: true-colour black is a colour, not an absent code.
+    #[test]
+    fn true_colour_black_is_not_treated_as_absent() {
+        let e = entity(&[(420, 0), (62, 1)]);
+        assert_eq!(
+            resolve_color(&e, Some(&layer(3, None)), Rgb::BLACK, ColorMode::Color),
+            Rgb::BLACK,
+            "0x000000 in code 420 means black, not 'no true colour'"
+        );
     }
 
     #[test]

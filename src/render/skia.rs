@@ -76,6 +76,10 @@ fn draw_into(
         scene.paper.height_mm as f32 * pixels_per_mm - origin_y,
     );
 
+    // Mirror the PDF backend's clip to the printable area, or the preview
+    // shows ink in the margin that the exported page does not have.
+    let clip = clip_mask(pixmap.width(), pixmap.height(), scene, transform);
+
     for item in &scene.items {
         match item {
             PlotItem::Path { geom, style } => {
@@ -93,7 +97,13 @@ fn draw_into(
                         stroke.dash = StrokeDash::new(usable, 0.0);
                     }
                 }
-                pixmap.stroke_path(&path, &paint_for(style.color), &stroke, transform, None);
+                pixmap.stroke_path(
+                    &path,
+                    &paint_for(style.color),
+                    &stroke,
+                    transform,
+                    clip.as_ref(),
+                );
             }
             PlotItem::Fill { geom, color } => {
                 let Some(path) = build_path(geom) else { continue };
@@ -102,11 +112,34 @@ fn draw_into(
                     &paint_for(*color),
                     tiny_skia::FillRule::Winding,
                     transform,
-                    None,
+                    clip.as_ref(),
                 );
             }
         }
     }
+}
+
+/// A mask covering the scene's printable area, in the pixmap's pixel space.
+fn clip_mask(
+    width: u32,
+    height: u32,
+    scene: &PlotScene,
+    transform: Transform,
+) -> Option<tiny_skia::Mask> {
+    let area = scene.clip?;
+    if !area.valid() || area.width() <= 0.0 || area.height() <= 0.0 {
+        return None;
+    }
+    let rect = tiny_skia::Rect::from_xywh(
+        area.min_x as f32,
+        area.min_y as f32,
+        area.width() as f32,
+        area.height() as f32,
+    )?;
+    let path = PathBuilder::from_rect(rect);
+    let mut mask = tiny_skia::Mask::new(width, height)?;
+    mask.fill_path(&path, tiny_skia::FillRule::Winding, true, transform);
+    Some(mask)
 }
 
 fn build_path(geom: &crate::geom::PathGeom) -> Option<tiny_skia::Path> {
@@ -226,6 +259,26 @@ mod tests {
         assert!(
             actual.abs_diff(expected) <= 1,
             "expected the mark near row {expected}, found it at {actual}"
+        );
+    }
+
+    /// I8, screen side: the preview must clip where the PDF clips, or the
+    /// two disagree about what is on the page.
+    #[test]
+    fn the_clip_keeps_ink_out_of_the_margin() {
+        let mut s = scene_with(1.0);
+        let unclipped = non_white_pixels(&render(&s, 4.0));
+
+        let mut area = crate::geom::Bounds::empty();
+        area.add(crate::geom::Point::new(0.0, 0.0));
+        area.add(crate::geom::Point::new(50.0, 100.0));
+        s.clip = Some(area);
+        let clipped = non_white_pixels(&render(&s, 4.0));
+
+        assert!(clipped > 0, "the clip erased everything");
+        assert!(
+            (clipped as f64) < (unclipped as f64) * 0.6,
+            "half the line lies outside the clip: {clipped} vs {unclipped}"
         );
     }
 

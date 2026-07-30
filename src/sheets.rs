@@ -4,7 +4,7 @@ use crate::plot::flatten::flatten;
 
 /// Aspect ratios that indicate a real sheet: ISO A-series plus the GB
 /// extended formats used in Chinese practice.
-const SHEET_RATIOS: [f64; 4] = [1.4142, 1.5, 2.0, 3.0];
+const SHEET_RATIOS: [f64; 4] = [std::f64::consts::SQRT_2, 1.5, 2.0, 3.0];
 
 /// Minimum score for a purely geometric candidate to be accepted. This is
 /// the only tuning knob in the detector; keep it here, not scattered
@@ -34,11 +34,13 @@ fn is_frame_name(name: &str) -> bool {
         || upper == "TK"
 }
 
-/// Untransformed extents of a block's body.
+/// Untransformed extents of a block's body, in the block's own coordinate
+/// system (so still measured from its base point, not from the insertion
+/// point).
 pub fn block_extents(doc: &Document, name: &str) -> Option<Bounds> {
-    let body = doc.blocks.get(name)?;
+    let block = doc.blocks.get(name)?;
     let mut b = Bounds::empty();
-    for ent in body {
+    for ent in &block.entities {
         if let Some(f) = flatten(ent, Affine::identity()) {
             let fb = f.geom.bounds();
             if fb.valid() {
@@ -81,7 +83,12 @@ pub fn collect_candidates(doc: &Document) -> Vec<Candidate> {
             continue;
         }
         let Some(extents) = block_extents(doc, &name) else { continue };
-        let t = Affine::scale(ent.f64(41, 1.0), ent.f64(42, 1.0))
+        // Same placement chain the plot builder uses, base point included:
+        // a frame block authored away from its own origin would otherwise
+        // put the detected page window in the wrong place.
+        let base = doc.blocks.get(&name).map(|b| b.base).unwrap_or_default();
+        let t = Affine::translation(-base.x, -base.y)
+            .then(Affine::scale(ent.f64(41, 1.0), ent.f64(42, 1.0)))
             .then(Affine::rotation(ent.f64(50, 0.0)))
             .then(Affine::translation(ent.f64(10, 0.0), ent.f64(20, 0.0)));
         let mut b = Bounds::empty();
@@ -187,8 +194,19 @@ pub fn reject_containers(candidates: Vec<Candidate>) -> Vec<Candidate> {
                 continue;
             }
             if nearly_coincident(outer.bounds, inner.bounds) {
-                // Same border drawn twice: suppress the inner copy.
-                keep[j] = false;
+                // Same border drawn twice: suppress the inner copy. The rule
+                // has to be asymmetric, because `contains` accepts equality:
+                // two byte-identical candidates each contain the other, so a
+                // symmetric "drop the inner one" would run twice and delete
+                // both — losing a whole page in silence for something as
+                // ordinary as a frame pasted in place. Suppress the strictly
+                // smaller of the pair, and break an exact tie on index so
+                // exactly one survivor is guaranteed.
+                let outer_area = outer.bounds.width() * outer.bounds.height();
+                let inner_area = inner.bounds.width() * inner.bounds.height();
+                if outer_area > inner_area || (outer_area == inner_area && i < j) {
+                    keep[j] = false;
+                }
                 continue;
             }
             enclosed += 1;
@@ -349,6 +367,32 @@ mod tests {
         let kept = reject_containers(vec![outer, inner]);
         assert_eq!(kept.len(), 1);
         assert!((kept[0].bounds.width() - 420.0).abs() < 0.01, "should keep the outer");
+    }
+
+    /// C2: a frame block inserted twice at the same point — copy-paste in
+    /// place, or the same frame duplicated onto a second layer — produces
+    /// two identical candidates. `Bounds::contains` accepts equality, so
+    /// each contains the other; before the asymmetric rule both were
+    /// dropped and the page vanished from the PDF with no warning and no
+    /// report entry.
+    #[test]
+    fn two_coincident_candidates_leave_exactly_one_survivor() {
+        let a = candidate(0.0, 0.0, 420.0, 297.0);
+        let b = candidate(0.0, 0.0, 420.0, 297.0);
+        let kept = reject_containers(vec![a, b]);
+        assert_eq!(kept.len(), 1, "an identical pair must leave one page, got {kept:?}");
+        assert!((kept[0].bounds.width() - 420.0).abs() < 0.01);
+    }
+
+    /// The same property with the duplicate a hair smaller, which is what a
+    /// frame re-inserted at a rounded coordinate looks like.
+    #[test]
+    fn a_nearly_coincident_duplicate_leaves_the_larger_one() {
+        let big = candidate(0.0, 0.0, 420.0, 297.0);
+        let small = candidate(0.0, 0.0, 419.0, 296.5);
+        let kept = reject_containers(vec![small, big]);
+        assert_eq!(kept.len(), 1);
+        assert!((kept[0].bounds.width() - 420.0).abs() < 0.01, "kept the smaller copy");
     }
 
     #[test]

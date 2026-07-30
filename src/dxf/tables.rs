@@ -34,6 +34,20 @@ pub struct LayerRecord {
     pub true_color: Option<u32>,
     pub lineweight: i16,
     pub linetype: String,
+    /// Layer switched off. DXF marks this by negating group 62 rather than
+    /// with a flag of its own.
+    pub off: bool,
+    /// Group 70 bit 1.
+    pub frozen: bool,
+    /// Group 290, absent meaning plottable.
+    pub plottable: bool,
+}
+
+impl LayerRecord {
+    /// Whether AutoCAD would put ink on paper for entities on this layer.
+    pub fn plotted(&self) -> bool {
+        !self.off && !self.frozen && self.plottable
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -143,11 +157,16 @@ pub fn read_layers(pairs: &[Pair], cp: Codepage) -> HashMap<String, LayerRecord>
     let mut out = HashMap::new();
     for rec in table_records(pairs, "LAYER") {
         let Some(name) = record_string(&rec, 2, cp) else { continue };
+        let aci = record_i32(&rec, 62).unwrap_or(7);
+        let flags = record_i32(&rec, 70).unwrap_or(0);
         let record = LayerRecord {
-            aci: record_i32(&rec, 62).unwrap_or(7) as i16,
-            true_color: record_i32(&rec, 420).filter(|v| *v > 0).map(|v| v as u32),
+            aci: aci as i16,
+            true_color: record_i32(&rec, 420).filter(|v| *v >= 0).map(|v| v as u32),
             lineweight: record_i32(&rec, 370).unwrap_or(-3) as i16,
             linetype: record_string(&rec, 6, cp).unwrap_or_else(|| "CONTINUOUS".to_owned()),
+            off: aci < 0,
+            frozen: flags & 1 != 0,
+            plottable: record_i32(&rec, 290).unwrap_or(1) != 0,
             name: name.clone(),
         };
         out.insert(name, record);
@@ -164,7 +183,10 @@ pub fn read_ltypes(pairs: &[Pair], cp: Codepage) -> HashMap<String, LtypeRecord>
             .filter(|p| p.code == 49)
             .filter_map(|p| p.value.as_f64())
             .collect();
-        out.insert(name.clone(), LtypeRecord { name, pattern });
+        // Keyed upper-case: linetype names are case-insensitive in AutoCAD,
+        // and an entity naming `hidden` must find the `HIDDEN` record
+        // rather than falling through to a solid line.
+        out.insert(name.to_ascii_uppercase(), LtypeRecord { name, pattern });
     }
     out
 }

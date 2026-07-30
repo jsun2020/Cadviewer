@@ -90,11 +90,16 @@ impl PaperSize {
 pub struct PlotScene {
     pub paper: PaperSize,
     pub items: Vec<PlotItem>,
+    /// Printable area in paper millimetres. Renderers clip to it, which is
+    /// what stops an entity straddling the frame edge — the neighbouring
+    /// sheet on a tiled model space — from being drawn across this page's
+    /// margin. `None` leaves the whole sheet inkable.
+    pub clip: Option<crate::geom::Bounds>,
 }
 
 impl PlotScene {
     pub fn new(paper: PaperSize) -> Self {
-        Self { paper, items: Vec::new() }
+        Self { paper, items: Vec::new(), clip: None }
     }
 }
 
