@@ -47,7 +47,7 @@ fn main() -> eframe::Result {
 
 fn convert_file(input: &Path, output: &Path) -> Result<(), String> {
     let converted = converter::convert_to_svg(input)?;
-    pdf::svg_to_pdf(&converted.svg, output)
+    pdf::svg_to_pdf(&converted.pdf_svg, output)
 }
 
 fn show_error(message: &str) {
@@ -60,7 +60,7 @@ fn show_error(message: &str) {
 
 struct LoadedDocument {
     source: PathBuf,
-    svg: Arc<String>,
+    pdf_svg: Arc<String>,
     tree: Arc<resvg::usvg::Tree>,
     entity_count: usize,
     warnings: String,
@@ -139,7 +139,7 @@ impl CadviewerApp {
         };
         self.exporting = true;
         self.status = format!("正在生成 {}…", file_name(&path));
-        let svg = Arc::clone(&document.svg);
+        let svg = Arc::clone(&document.pdf_svg);
         let sender = self.sender.clone();
         let context = context.clone();
         std::thread::spawn(move || {
@@ -278,7 +278,7 @@ impl CadviewerApp {
             self.status = "无法分配渲染缓冲区".to_owned();
             return;
         };
-        pixmap.fill(tiny_skia::Color::WHITE);
+        pixmap.fill(tiny_skia::Color::from_rgba8(32, 40, 48, 255));
 
         let scale = self.zoom * render_scale;
         let tx = width as f32 * 0.5 - self.center.x * scale;
@@ -466,7 +466,7 @@ fn load_document(path: &Path) -> Result<LoadedDocument, String> {
         .map_err(|error| format!("无法构建二维场景：{error}"))?;
     Ok(LoadedDocument {
         source: path.to_owned(),
-        svg: Arc::new(converted.svg),
+        pdf_svg: Arc::new(converted.pdf_svg),
         tree: Arc::new(tree),
         entity_count: converted.entity_count,
         warnings: converted.warnings,

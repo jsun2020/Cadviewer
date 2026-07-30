@@ -11,7 +11,7 @@ fn main() {
     let input = Path::new(&args[0]);
     let output = Path::new(&args[1]);
     let result = converter::convert_to_svg(input)
-        .and_then(|converted| pdf::svg_to_pdf(&converted.svg, output));
+        .and_then(|converted| pdf::svg_to_pdf(&converted.pdf_svg, output));
     if let Err(error) = result {
         eprintln!("Cadconvert: {error}");
         std::process::exit(1);

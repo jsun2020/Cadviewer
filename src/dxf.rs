@@ -4,6 +4,14 @@ use std::fmt::Write as _;
 
 const MAX_PRIMITIVES: usize = 1_000_000;
 const MAX_BLOCK_DEPTH: usize = 24;
+// Keep ordinary CAD geometry in "hairline" territory.  The previous 0.72
+// normalized-unit stroke was roughly a 0.19 mm plotted pen and became much
+// heavier wherever a drawing contains coincident entities.  A thinner screen
+// stroke also matches the usual CAD "display lineweights off" presentation.
+const SCREEN_STROKE_WIDTH: f64 = 0.36;
+const PRINT_STROKE_WIDTH: f64 = 0.32;
+const SCREEN_POINT_RADIUS: f64 = 0.65;
+const PRINT_POINT_RADIUS: f64 = 0.55;
 
 #[derive(Clone, Copy, Debug, Default)]
 struct Point {
@@ -123,18 +131,68 @@ pub enum Primitive {
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct CadColor(u32);
+pub struct CadColor {
+    rgb: u32,
+    adaptive_black_white: bool,
+}
 
 impl CadColor {
-    const WHITE: Self = Self(0xE5E7EB);
+    const ADAPTIVE_BLACK_WHITE: Self = Self {
+        rgb: 0xE5E7EB,
+        adaptive_black_white: true,
+    };
 
     fn from_rgb(rgb: u32) -> Self {
-        Self(rgb & 0x00FF_FFFF)
+        Self {
+            rgb: rgb & 0x00FF_FFFF,
+            adaptive_black_white: false,
+        }
     }
 
-    fn hex(self) -> String {
-        format!("#{:06X}", self.0)
+    fn hex(self, output: SvgOutput) -> String {
+        let rgb = match output {
+            SvgOutput::Screen => self.rgb,
+            SvgOutput::Print => self.print_rgb(),
+        };
+        format!("#{rgb:06X}")
     }
+
+    fn print_rgb(self) -> u32 {
+        if self.adaptive_black_white {
+            return 0x000000;
+        }
+
+        let red = ((self.rgb >> 16) & 0xFF) as f64;
+        let green = ((self.rgb >> 8) & 0xFF) as f64;
+        let blue = (self.rgb & 0xFF) as f64;
+        let maximum = red.max(green).max(blue);
+        let minimum = red.min(green).min(blue);
+
+        // Explicit white and near-white neutral colors are commonly used as
+        // screen foreground colors in CAD files. They need to become ink on
+        // a white PDF page instead of disappearing.
+        if minimum >= 224.0 && maximum - minimum <= 24.0 {
+            return 0x111827;
+        }
+
+        // Preserve the hue of bright CAD colors while ensuring that they
+        // remain legible on paper. This particularly helps yellow, cyan and
+        // light green layers without turning a color drawing monochrome.
+        let luminance = (0.2126 * red + 0.7152 * green + 0.0722 * blue) / 255.0;
+        if luminance > 0.68 {
+            let factor = 0.68 / luminance;
+            let channel = |value: f64| (value * factor).round().clamp(0.0, 255.0) as u32;
+            return (channel(red) << 16) | (channel(green) << 8) | channel(blue);
+        }
+
+        self.rgb
+    }
+}
+
+#[derive(Clone, Copy)]
+enum SvgOutput {
+    Screen,
+    Print,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -315,7 +373,7 @@ pub fn parse(input: &str) -> Result<Scene, String> {
         &layers,
         initial_view,
         Affine::IDENTITY,
-        CadColor::WHITE,
+        CadColor::ADAPTIVE_BLACK_WHITE,
         &mut active_blocks,
         0,
         &mut primitives,
@@ -323,9 +381,6 @@ pub fn parse(input: &str) -> Result<Scene, String> {
 
     let mut bounds = initial_view.unwrap_or_else(Bounds::empty);
     for primitive in &primitives {
-        if initial_view.is_some() {
-            break;
-        }
         match primitive {
             Primitive::Polyline { points, .. } => {
                 for &(x, y) in points {
@@ -370,6 +425,14 @@ pub fn parse(input: &str) -> Result<Scene, String> {
 
 impl Scene {
     pub fn to_svg(&self) -> String {
+        self.to_svg_for(SvgOutput::Screen)
+    }
+
+    pub fn to_pdf_svg(&self) -> String {
+        self.to_svg_for(SvgOutput::Print)
+    }
+
+    fn to_svg_for(&self, output: SvgOutput) -> String {
         let raw_width = (self.bounds.max_x - self.bounds.min_x).max(f64::EPSILON);
         let raw_height = (self.bounds.max_y - self.bounds.min_y).max(f64::EPSILON);
         let raw_long_side = raw_width.max(raw_height);
@@ -377,8 +440,10 @@ impl Scene {
         let scale = 1000.0 / (raw_long_side + margin * 2.0);
         let width = (raw_width + margin * 2.0) * scale;
         let height = (raw_height + margin * 2.0) * scale;
-        let stroke_width = 0.72_f64;
-        let point_radius = 1.5_f64;
+        let (stroke_width, point_radius) = match output {
+            SvgOutput::Screen => (SCREEN_STROKE_WIDTH, SCREEN_POINT_RADIUS),
+            SvgOutput::Print => (PRINT_STROKE_WIDTH, PRINT_POINT_RADIUS),
+        };
 
         let map = |x: f64, y: f64| {
             (
@@ -394,8 +459,14 @@ impl Scene {
             r#"<svg xmlns="http://www.w3.org/2000/svg" width="{width:.4}" height="{height:.4}" viewBox="0 0 {width:.4} {height:.4}">"#
         ));
         svg.push('\n');
-        svg.push_str(r##"<rect width="100%" height="100%" fill="#202830"/>"##);
-        svg.push('\n');
+        let background = match output {
+            SvgOutput::Screen => "#202830",
+            SvgOutput::Print => "#FFFFFF",
+        };
+        let _ = writeln!(
+            svg,
+            r#"<rect width="100%" height="100%" fill="{background}"/>"#
+        );
 
         let mut paths: BTreeMap<(CadColor, bool), String> = BTreeMap::new();
         for primitive in &self.primitives {
@@ -432,16 +503,13 @@ impl Scene {
         }
 
         for ((color, filled), data) in paths {
-            let color = color.hex();
+            let color = color.hex(output);
             if filled {
-                let _ = writeln!(
-                    svg,
-                    r#"<path d="{data}" fill="{color}" stroke="{color}" stroke-width="{stroke_width}" stroke-linejoin="round"/>"#
-                );
+                let _ = writeln!(svg, r#"<path d="{data}" fill="{color}" stroke="none"/>"#);
             } else {
                 let _ = writeln!(
                     svg,
-                    r#"<path d="{data}" fill="none" stroke="{color}" stroke-width="{stroke_width}" stroke-linecap="round" stroke-linejoin="round"/>"#
+                    r#"<path d="{data}" fill="none" stroke="{color}" stroke-width="{stroke_width}" stroke-linecap="butt" stroke-linejoin="miter" stroke-miterlimit="4"/>"#
                 );
             }
         }
@@ -476,7 +544,7 @@ impl Scene {
                     TextBaseline::Middle => "central",
                     TextBaseline::Bottom => "text-after-edge",
                 };
-                let color = color.hex();
+                let color = color.hex(output);
                 svg.push_str(&format!(
                     r#"<text x="{x:.4}" y="{y:.4}" font-family="SimSun, Microsoft YaHei, Arial, sans-serif" font-size="{font_size:.4}" fill="{color}" text-anchor="{text_anchor}" dominant-baseline="{baseline}" transform="translate({x:.4} {y:.4}) rotate({:.4}) scale({:.4} 1) translate({:.4} {:.4})">{escaped}</text>"#,
                     -*rotation,
@@ -771,7 +839,8 @@ fn resolve_color(
 
 fn aci_color(index: u32) -> CadColor {
     match index {
-        0 | 7 | 255 | 256 => CadColor::WHITE,
+        0 | 7 | 256 => CadColor::ADAPTIVE_BLACK_WHITE,
+        255 => CadColor::from_rgb(0xFF_FF_FF),
         1 => CadColor::from_rgb(0xFF_3B_30),
         2 => CadColor::from_rgb(0xFF_D6_0A),
         3 => CadColor::from_rgb(0x35_EB_5B),
@@ -794,7 +863,7 @@ fn aci_color(index: u32) -> CadColor {
             let gray = grays[(index - 250) as usize];
             CadColor::from_rgb((gray << 16) | (gray << 8) | gray)
         }
-        _ => CadColor::WHITE,
+        _ => CadColor::ADAPTIVE_BLACK_WHITE,
     }
 }
 
@@ -1571,6 +1640,86 @@ mod tests {
         let svg = scene.to_svg();
         assert!(svg.contains("<path"));
         assert!(svg.contains("viewBox=\"0 0"));
+    }
+
+    #[test]
+    fn uses_screen_and_paper_appropriate_colors() {
+        let scene = Scene {
+            primitives: vec![
+                Primitive::Polyline {
+                    points: vec![(0.0, 0.0), (10.0, 10.0)],
+                    closed: false,
+                    filled: false,
+                    color: CadColor::ADAPTIVE_BLACK_WHITE,
+                },
+                Primitive::Polyline {
+                    points: vec![(0.0, 10.0), (10.0, 0.0)],
+                    closed: false,
+                    filled: false,
+                    color: CadColor::from_rgb(0xFF_FF_FF),
+                },
+                Primitive::Polyline {
+                    points: vec![(2.0, 2.0), (4.0, 2.0), (3.0, 4.0)],
+                    closed: true,
+                    filled: true,
+                    color: CadColor::from_rgb(0xFF_00_00),
+                },
+            ],
+            bounds: Bounds {
+                min_x: 0.0,
+                min_y: 0.0,
+                max_x: 10.0,
+                max_y: 10.0,
+            },
+        };
+
+        let screen_svg = scene.to_svg();
+        assert!(screen_svg.contains(r##"fill="#202830""##));
+        assert!(screen_svg.contains(r##"stroke="#E5E7EB""##));
+        assert!(screen_svg.contains(r##"stroke="#FFFFFF""##));
+        assert!(screen_svg.contains(r#"stroke-width="0.36""#));
+        assert!(screen_svg.contains(r#"stroke-linecap="butt""#));
+        assert!(screen_svg.contains(r##"fill="#FF0000" stroke="none""##));
+
+        let pdf_svg = scene.to_pdf_svg();
+        assert!(pdf_svg.contains(r##"fill="#FFFFFF""##));
+        assert!(!pdf_svg.contains("#202830"));
+        assert!(pdf_svg.contains(r##"stroke="#000000""##));
+        assert!(pdf_svg.contains(r##"stroke="#111827""##));
+        assert!(pdf_svg.contains(r#"stroke-width="0.32""#));
+    }
+
+    #[test]
+    fn expands_the_page_to_include_visible_entities_outside_the_saved_view() {
+        let dxf = concat!(
+            "0\nSECTION\n2\nTABLES\n",
+            "0\nTABLE\n2\nVPORT\n",
+            "0\nVPORT\n2\n*ACTIVE\n12\n50\n22\n50\n40\n100\n41\n1\n",
+            "0\nENDTAB\n0\nENDSEC\n",
+            "0\nSECTION\n2\nENTITIES\n",
+            "0\nLINE\n10\n10\n20\n120\n11\n90\n21\n120\n",
+            "0\nENDSEC\n0\nEOF\n"
+        );
+
+        let scene = parse(dxf).unwrap();
+        assert!(
+            scene.bounds.max_y >= 120.0,
+            "the PDF page must include geometry that the viewer renders"
+        );
+        assert!(scene.to_pdf_svg().contains("<path"));
+    }
+
+    #[test]
+    fn darkens_bright_colors_for_white_paper_without_losing_hue() {
+        let yellow = CadColor::from_rgb(0xFF_FF_00).print_rgb();
+        let red = (yellow >> 16) & 0xFF;
+        let green = (yellow >> 8) & 0xFF;
+        let blue = yellow & 0xFF;
+
+        assert_eq!(red, green);
+        assert_eq!(blue, 0);
+        assert!(red < 0xFF);
+        assert_eq!(CadColor::from_rgb(0x00_00_00).print_rgb(), 0x00_00_00);
     }
 
     #[test]

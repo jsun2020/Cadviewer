@@ -12,6 +12,7 @@ const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 #[derive(Debug)]
 pub struct ConvertedDrawing {
     pub svg: String,
+    pub pdf_svg: String,
     pub warnings: String,
     pub entity_count: usize,
 }
@@ -84,6 +85,7 @@ pub fn convert_to_svg(input: &Path) -> Result<ConvertedDrawing, String> {
 
     Ok(ConvertedDrawing {
         svg: scene.to_svg(),
+        pdf_svg: scene.to_pdf_svg(),
         warnings,
         entity_count,
     })
