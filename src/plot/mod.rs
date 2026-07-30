@@ -1,5 +1,6 @@
 use crate::geom::PathGeom;
 
+pub mod build;
 pub mod flatten;
 pub mod style;
 
