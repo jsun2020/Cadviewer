@@ -2,9 +2,11 @@
 
 use cadviewer::converter;
 use cadviewer::doc::Document;
-use cadviewer::plot::PlotScene;
+use cadviewer::plot::build::{BuildReport, PlotRequest, build, model_extents};
 use cadviewer::plot::style::ColorMode;
-use cadviewer::render::{pdf::write_pdf, skia};
+use cadviewer::plot::{PaperSize, PlotScene};
+use cadviewer::render::skia;
+use cadviewer::sheets::Sheet;
 use eframe::egui;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -61,21 +63,90 @@ fn show_error(message: &str) {
         .show();
 }
 
+/// The plot request for one detected sheet, or for the whole model when the
+/// drawing has no title-block frames (R-SHEET-6: that is never an error).
+///
+/// The paper choice deliberately mirrors `converter::scenes_for`: for a sheet
+/// it follows the frame's *aspect ratio*, not its size in drawing units, so a
+/// 1:100 frame measuring 42000 x 29700 units lands on A3 rather than A0.
+/// Picking the paper any other way here would give the preview a different
+/// sheet size from the exported PDF, and since lineweights are absolute
+/// millimetres the lines would visibly differ in thickness between the two.
+fn sheet_request(
+    doc: &Document,
+    sheets: &[Sheet],
+    active: usize,
+    mode: ColorMode,
+) -> Option<PlotRequest> {
+    let frame = sheets.get(active).map(|sheet| sheet.bounds);
+    let window = frame.unwrap_or_else(|| model_extents(doc));
+    if !window.valid() {
+        return None;
+    }
+    let paper = match frame {
+        Some(_) => {
+            let ratio = window.width() / window.height().max(f64::EPSILON);
+            if ratio >= 1.0 {
+                PaperSize::fit(297.0 * ratio, 297.0)
+            } else {
+                PaperSize::fit(297.0, 297.0 / ratio)
+            }
+        }
+        None => PaperSize::fit(window.width(), window.height()),
+    };
+    Some(PlotRequest {
+        window,
+        paper,
+        margin_mm: converter::DEFAULT_MARGIN_MM,
+        mode,
+    })
+}
+
+/// Entity kinds the builder could not draw, with counts, for the warnings
+/// area. TEXT and MTEXT are expected here until the text phase lands.
+fn skipped_summary(report: &BuildReport) -> String {
+    if report.skipped.is_empty() {
+        return String::new();
+    }
+    let mut kinds: Vec<_> = report.skipped.iter().collect();
+    kinds.sort();
+    let list = kinds
+        .iter()
+        .map(|(kind, count)| format!("{kind} x{count}"))
+        .collect::<Vec<_>>()
+        .join("、");
+    format!("未绘制实体：{list}")
+}
+
 struct LoadedDocument {
     source: PathBuf,
-    /// Kept for Phase 3, which re-plots the same document once per detected
-    /// sheet instead of once for the whole model.
+    /// Kept in memory so switching sheets re-plots the parsed document
+    /// instead of re-running dwg2dxf.
     doc: Arc<Document>,
+    sheets: Vec<Sheet>,
     scene: Arc<PlotScene>,
     item_count: usize,
-    warnings: String,
+    /// Loader warnings (LibreDWG stderr), held apart from the per-build
+    /// skipped summary so switching sheets cannot accumulate copies of it.
+    load_warnings: String,
+    skipped: String,
+}
+
+struct BuiltScene {
+    /// Which loaded document this scene belongs to. A rebuild in flight when
+    /// a new file finishes loading must not overwrite the new document.
+    generation: u64,
+    scene: Arc<PlotScene>,
+    item_count: usize,
+    skipped: String,
 }
 
 enum AppMessage {
     Loaded(Result<LoadedDocument, String>),
+    Rebuilt(BuiltScene),
     Exported {
         path: PathBuf,
-        result: Result<(), String>,
+        result: Result<usize, String>,
     },
 }
 
@@ -83,6 +154,7 @@ struct CadviewerApp {
     sender: Sender<AppMessage>,
     receiver: Receiver<AppMessage>,
     document: Option<LoadedDocument>,
+    generation: u64,
     texture: Option<egui::TextureHandle>,
     /// Sheet point under the middle of the viewport, in millimetres measured
     /// from the top-left corner of the paper (y grows downwards, matching
@@ -97,7 +169,16 @@ struct CadviewerApp {
     loading: bool,
     exporting: bool,
     fit_requested: bool,
+    active_sheet: usize,
+    color_mode: ColorMode,
+    /// Set only when the active sheet or the colour mode actually changes.
+    /// A rebuild walks every entity and expands every block, which takes
+    /// seconds on a real drawing, so this must never be set from a hover, a
+    /// zoom, a pan or an unconditional per-frame path.
+    needs_rebuild: bool,
+    rebuilding: bool,
     status: String,
+    warnings: String,
 }
 
 impl CadviewerApp {
@@ -109,6 +190,7 @@ impl CadviewerApp {
             sender,
             receiver,
             document: None,
+            generation: 0,
             texture: None,
             center: egui::Pos2::ZERO,
             zoom: 1.0,
@@ -119,7 +201,12 @@ impl CadviewerApp {
             loading: false,
             exporting: false,
             fit_requested: false,
+            active_sheet: 0,
+            color_mode: ColorMode::Color,
+            needs_rebuild: false,
+            rebuilding: false,
             status: "拖入 DWG 文件，或点击“打开”".to_owned(),
+            warnings: String::new(),
         };
         if let Some(path) = initial_file {
             app.begin_load(path, &context.egui_ctx);
@@ -133,30 +220,75 @@ impl CadviewerApp {
         }
         self.loading = true;
         self.status = format!("正在打开 {}…", file_name(&path));
+        let mode = self.color_mode;
         let sender = self.sender.clone();
         let context = context.clone();
         std::thread::spawn(move || {
-            let result = load_document(&path);
+            let result = load_document(&path, mode);
             let _ = sender.send(AppMessage::Loaded(result));
             context.request_repaint();
         });
     }
 
-    fn begin_export(&mut self, path: PathBuf, context: &egui::Context) {
+    /// Re-plot the loaded document for the active sheet and colour mode.
+    ///
+    /// Runs off the UI thread: on a real drawing one sheet takes seconds to
+    /// build, and blocking the event loop for that long would freeze the
+    /// window. Called only from the `needs_rebuild` edge in `ui`.
+    fn begin_rebuild(&mut self, context: &egui::Context) {
+        let Some(document) = &self.document else {
+            return;
+        };
+        if self.rebuilding {
+            return;
+        }
+        let Some(request) = sheet_request(
+            &document.doc,
+            &document.sheets,
+            self.active_sheet,
+            self.color_mode,
+        ) else {
+            self.status = "所选图纸中没有可打印的二维实体".to_owned();
+            return;
+        };
+        self.rebuilding = true;
+        self.status = if document.sheets.is_empty() {
+            "正在绘制…".to_owned()
+        } else {
+            format!("正在绘制第 {} 页…", self.active_sheet + 1)
+        };
+        let doc = Arc::clone(&document.doc);
+        let generation = self.generation;
+        let sender = self.sender.clone();
+        let context = context.clone();
+        std::thread::spawn(move || {
+            let (scene, report) = build(&doc, &request);
+            let _ = sender.send(AppMessage::Rebuilt(BuiltScene {
+                generation,
+                item_count: report.items,
+                skipped: skipped_summary(&report),
+                scene: Arc::new(scene),
+            }));
+            context.request_repaint();
+        });
+    }
+
+    fn begin_export(&mut self, path: PathBuf, sheet: Option<usize>, context: &egui::Context) {
         let Some(document) = &self.document else {
             return;
         };
         self.exporting = true;
         self.status = format!("正在生成 {}…", file_name(&path));
-        let scene = Arc::clone(&document.scene);
+        let source = document.source.clone();
+        // Same entry point the command-line converter uses, so the exported
+        // PDF cannot differ from what `Cadconvert.exe` would produce; the
+        // preview matches it because `sheet_request` mirrors its window and
+        // paper choice.
+        let options = converter::ConvertOptions { mode: self.color_mode, sheet };
         let sender = self.sender.clone();
         let context = context.clone();
         std::thread::spawn(move || {
-            // Export exactly the scene on screen, so the PDF can never drift
-            // from the preview.
-            let bytes = write_pdf(std::slice::from_ref(scene.as_ref()));
-            let result = std::fs::write(&path, bytes)
-                .map_err(|error| format!("无法写入 PDF：{error}"));
+            let result = converter::convert_to_pdf(&source, &path, &options);
             let _ = sender.send(AppMessage::Exported { path, result });
             context.request_repaint();
         });
@@ -171,21 +303,13 @@ impl CadviewerApp {
                         Ok(document) => {
                             let title = format!("{} — Cadviewer", file_name(&document.source));
                             context.send_viewport_cmd(egui::ViewportCommand::Title(title));
-                            self.status = format!(
-                                "{} · {} 个实体 · {} 个图元{}",
-                                file_name(&document.source),
-                                document.doc.entities.len(),
-                                document.item_count,
-                                if document.warnings.is_empty() {
-                                    ""
-                                } else {
-                                    " · 部分高级对象已跳过"
-                                }
-                            );
+                            self.generation += 1;
+                            self.active_sheet = 0;
                             self.document = Some(document);
                             self.texture = None;
                             self.fit_requested = true;
                             self.render_dirty = true;
+                            self.refresh_status();
                         }
                         Err(error) => {
                             self.status = error.clone();
@@ -193,11 +317,26 @@ impl CadviewerApp {
                         }
                     }
                 }
+                AppMessage::Rebuilt(built) => {
+                    self.rebuilding = false;
+                    if built.generation != self.generation {
+                        // Belongs to a document that has since been replaced.
+                        continue;
+                    }
+                    if let Some(document) = &mut self.document {
+                        document.scene = built.scene;
+                        document.item_count = built.item_count;
+                        document.skipped = built.skipped;
+                    }
+                    self.fit_requested = true;
+                    self.render_dirty = true;
+                    self.refresh_status();
+                }
                 AppMessage::Exported { path, result } => {
                     self.exporting = false;
                     match result {
-                        Ok(()) => {
-                            self.status = format!("已导出 {}", path.display());
+                        Ok(pages) => {
+                            self.status = format!("已导出 {pages} 页：{}", path.display());
                         }
                         Err(error) => {
                             self.status = error.clone();
@@ -207,6 +346,30 @@ impl CadviewerApp {
                 }
             }
         }
+    }
+
+    fn refresh_status(&mut self) {
+        let Some(document) = &self.document else {
+            return;
+        };
+        let page = if document.sheets.is_empty() {
+            "整幅模型".to_owned()
+        } else {
+            format!("第 {}/{} 页", self.active_sheet + 1, document.sheets.len())
+        };
+        self.status = format!(
+            "{} · {} · {} 个实体 · {} 个图元",
+            file_name(&document.source),
+            page,
+            document.doc.entities.len(),
+            document.item_count
+        );
+        self.warnings = [document.load_warnings.as_str(), document.skipped.as_str()]
+            .iter()
+            .filter(|part| !part.is_empty())
+            .copied()
+            .collect::<Vec<_>>()
+            .join("\n");
     }
 
     fn open_dialog(&mut self, context: &egui::Context) {
@@ -219,16 +382,22 @@ impl CadviewerApp {
         }
     }
 
-    fn export_dialog(&mut self, context: &egui::Context) {
+    fn export_dialog(&mut self, context: &egui::Context, current_only: bool) {
         let Some(document) = &self.document else {
             return;
         };
-        let default_name = document
+        let stem = document
             .source
             .file_stem()
             .and_then(|name| name.to_str())
-            .map(|name| format!("{name}.pdf"))
-            .unwrap_or_else(|| "drawing.pdf".to_owned());
+            .unwrap_or("drawing")
+            .to_owned();
+        // With no frames detected there is exactly one page either way.
+        let sheet = (current_only && !document.sheets.is_empty()).then_some(self.active_sheet + 1);
+        let default_name = match sheet {
+            Some(index) => format!("{stem}-{index}.pdf"),
+            None => format!("{stem}.pdf"),
+        };
         if let Some(path) = rfd::FileDialog::new()
             .set_title("导出 PDF")
             .set_file_name(default_name)
@@ -240,7 +409,7 @@ impl CadviewerApp {
             } else {
                 path
             };
-            self.begin_export(path, context);
+            self.begin_export(path, sheet, context);
         }
     }
 
@@ -325,6 +494,14 @@ impl eframe::App for CadviewerApp {
         let context = root_ui.ctx().clone();
         self.drain_messages(&context);
 
+        // The only place a rebuild starts. `needs_rebuild` is an edge set by
+        // a sheet click, the colour toggle or a fresh load -- never by the
+        // frame loop -- so an idle or merely hovered window rebuilds nothing.
+        if self.needs_rebuild && !self.rebuilding {
+            self.needs_rebuild = false;
+            self.begin_rebuild(&context);
+        }
+
         let dropped_file = context.input(|input| {
             input
                 .raw
@@ -364,14 +541,33 @@ impl eframe::App for CadviewerApp {
                     {
                         self.open_dialog(&context);
                     }
+                    let ready = self.document.is_some() && !self.exporting;
                     if ui
-                        .add_enabled(
-                            self.document.is_some() && !self.exporting,
-                            egui::Button::new("导出 PDF"),
-                        )
+                        .add_enabled(ready, egui::Button::new("导出当前页"))
                         .clicked()
                     {
-                        self.export_dialog(&context);
+                        self.export_dialog(&context, true);
+                    }
+                    if ui
+                        .add_enabled(ready, egui::Button::new("导出全部"))
+                        .clicked()
+                    {
+                        self.export_dialog(&context, false);
+                    }
+                    let mut mono = self.color_mode == ColorMode::Monochrome;
+                    if ui
+                        .add_enabled(
+                            self.document.is_some(),
+                            egui::Checkbox::new(&mut mono, "单色打印"),
+                        )
+                        .changed()
+                    {
+                        self.color_mode = if mono {
+                            ColorMode::Monochrome
+                        } else {
+                            ColorMode::Color
+                        };
+                        self.needs_rebuild = true;
                     }
                     ui.separator();
                     if ui
@@ -399,7 +595,7 @@ impl eframe::App for CadviewerApp {
                         self.fit_requested = true;
                     }
                     ui.separator();
-                    if self.loading || self.exporting {
+                    if self.loading || self.exporting || self.rebuilding {
                         ui.spinner();
                     }
                     ui.label(
@@ -409,6 +605,55 @@ impl eframe::App for CadviewerApp {
                     );
                 });
             });
+
+        if !self.warnings.is_empty() {
+            egui::Panel::bottom("warnings").show(root_ui, |ui| {
+                egui::ScrollArea::vertical()
+                    .max_height(64.0)
+                    .show(ui, |ui| {
+                        ui.label(
+                            egui::RichText::new(&self.warnings)
+                                .small()
+                                .color(egui::Color32::from_rgb(206, 172, 108)),
+                        );
+                    });
+            });
+        }
+
+        let mut clicked_sheet = None;
+        if let Some(document) = &self.document
+            && !document.sheets.is_empty()
+        {
+            let sheets = &document.sheets;
+            let active = self.active_sheet;
+            egui::Panel::left("sheets")
+                .default_size(168.0)
+                .show(root_ui, |ui| {
+                    ui.add_space(6.0);
+                    ui.heading(format!("图纸 ({})", sheets.len()));
+                    ui.separator();
+                    egui::ScrollArea::vertical().show(ui, |ui| {
+                        for (index, sheet) in sheets.iter().enumerate() {
+                            let label = format!(
+                                "{:>2}. {:.0} x {:.0}",
+                                sheet.index,
+                                sheet.bounds.width(),
+                                sheet.bounds.height()
+                            );
+                            if ui.selectable_label(index == active, label).clicked() {
+                                clicked_sheet = Some(index);
+                            }
+                        }
+                    });
+                });
+        }
+        // Clicking the sheet already on screen must not start a rebuild.
+        if let Some(index) = clicked_sheet
+            && index != self.active_sheet
+        {
+            self.active_sheet = index;
+            self.needs_rebuild = true;
+        }
 
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE.fill(egui::Color32::from_rgb(29, 33, 40)))
@@ -481,15 +726,21 @@ impl eframe::App for CadviewerApp {
     }
 }
 
-fn load_document(path: &Path) -> Result<LoadedDocument, String> {
+fn load_document(path: &Path, mode: ColorMode) -> Result<LoadedDocument, String> {
     let loaded = converter::load(path)?;
-    let (scene, report) = converter::build_scene(&loaded.doc, ColorMode::Color)?;
+    let doc = loaded.doc;
+    let sheets = cadviewer::sheets::detect(&doc);
+    let request = sheet_request(&doc, &sheets, 0, mode)
+        .ok_or_else(|| "图纸中没有可打印的二维实体".to_owned())?;
+    let (scene, report) = build(&doc, &request);
     Ok(LoadedDocument {
         source: path.to_owned(),
-        doc: Arc::new(loaded.doc),
+        doc: Arc::new(doc),
+        sheets,
         scene: Arc::new(scene),
         item_count: report.items,
-        warnings: loaded.warnings,
+        load_warnings: loaded.warnings,
+        skipped: skipped_summary(&report),
     })
 }
 
