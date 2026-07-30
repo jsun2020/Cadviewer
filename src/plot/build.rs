@@ -155,22 +155,15 @@ fn emit(
     }
     let cp = doc.header.codepage;
 
-    let layer = doc.layer(&ent.layer(cp));
-    if let Some(record) = layer
-        && !record.plotted()
-    {
-        // AutoCAD does not plot entities on a layer that is off, frozen or
-        // marked non-plotting. Since matching its plotted output is the
-        // whole point, extra ink is a fidelity failure like any other.
-        *report.skipped.entry("不打印图层上的实体".to_owned()).or_default() += 1;
-        return;
-    }
-
     // A DIMENSION's linework lives in an anonymous block named in group 2,
     // and is drawn by expanding that block exactly as an INSERT is — the
     // difference is only that the block is already positioned in world
     // coordinates, so there is no local placement transform.
     if ent.kind == "INSERT" || ent.kind == "DIMENSION" {
+        let layer = doc.layer(&ent.layer(cp));
+        if !plotted(layer, report) {
+            return;
+        }
         let Some(name) = ent.text(2, cp) else { return };
         let Some(block) = doc.blocks.get(&name) else {
             *report.skipped.entry("INSERT(missing block)".to_owned()).or_default() += 1;
@@ -205,7 +198,10 @@ fn emit(
     };
 
     // Cull against the printable area. Done after transform so it costs one
-    // bounds comparison per entity rather than an inverse transform.
+    // bounds comparison per entity rather than an inverse transform, and
+    // before the layer lookup so the millions of entities a page discards
+    // never pay for one. (An INSERT has to look its layer up before
+    // descending, which is why that branch does it first.)
     let b = flat.geom.bounds();
     if !b.valid()
         || b.max_x < 0.0
@@ -213,6 +209,11 @@ fn emit(
         || b.max_y < 0.0
         || b.min_y > req.paper.height_mm
     {
+        return;
+    }
+
+    let layer = doc.layer(&ent.layer(cp));
+    if !plotted(layer, report) {
         return;
     }
 
@@ -237,6 +238,23 @@ fn emit(
         ),
     };
     scene.items.push(PlotItem::Path { geom: flat.geom, style });
+}
+
+/// Whether AutoCAD would put ink on paper for this entity's layer,
+/// counting the drop when it would not.
+///
+/// A layer that is off, frozen or marked non-plotting produces no ink at
+/// all. Since matching AutoCAD's plotted output is the whole purpose,
+/// extra ink is a fidelity failure like any other — and an invisible one
+/// until somebody overlays the reference.
+fn plotted(layer: Option<&crate::dxf::tables::LayerRecord>, report: &mut BuildReport) -> bool {
+    match layer {
+        Some(record) if !record.plotted() => {
+            *report.skipped.entry("不打印图层上的实体".to_owned()).or_default() += 1;
+            false
+        }
+        _ => true,
+    }
 }
 
 /// Highest column/row count an INSERT array may claim.
