@@ -1,5 +1,6 @@
 use crate::geom::PathGeom;
 
+pub mod flatten;
 pub mod style;
 
 /// PDF lineweight 0 means "thinnest line the device can draw". AutoCAD uses
