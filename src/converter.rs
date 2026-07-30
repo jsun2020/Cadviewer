@@ -12,6 +12,7 @@ use crate::plot::build::{BuildReport, PlotRequest, build, model_extents};
 use crate::plot::style::ColorMode;
 use crate::plot::PlotScene;
 use crate::render::pdf::write_pdf;
+use crate::sheets::detect;
 
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
@@ -113,14 +114,86 @@ pub fn build_scene(doc: &Document, mode: ColorMode) -> Result<(PlotScene, BuildR
     Ok((scene, report))
 }
 
-/// Convert to a single-page PDF covering model extents, returning the page
-/// count.
-pub fn convert_to_pdf(input: &Path, output: &Path, mode: ColorMode) -> Result<usize, String> {
+#[derive(Clone, Debug)]
+pub struct ConvertOptions {
+    pub mode: ColorMode,
+    /// 1-based page selection. `None` exports every sheet.
+    pub sheet: Option<usize>,
+}
+
+impl Default for ConvertOptions {
+    fn default() -> Self {
+        Self { mode: ColorMode::Color, sheet: None }
+    }
+}
+
+/// One scene per detected title-block frame, in reading order.
+///
+/// Paper size and plot scale come from the frame's own dimensions fitted to
+/// a standard sheet. The title block's printed scale text is deliberately
+/// ignored: it records the drawing scale, not the plot scale (PRD 3.10.3).
+pub fn scenes_for(doc: &Document, options: &ConvertOptions) -> Result<Vec<PlotScene>, String> {
+    let mut sheets = detect(doc);
+
+    if sheets.is_empty() {
+        // R-SHEET-6: never fail, fall back to the whole model space.
+        let window = model_extents(doc);
+        if !window.valid() {
+            return Err("图纸中没有可打印的二维实体".to_owned());
+        }
+        let req = PlotRequest {
+            window,
+            paper: PaperSize::fit(window.width(), window.height()),
+            margin_mm: DEFAULT_MARGIN_MM,
+            mode: options.mode,
+        };
+        let (scene, _) = build(doc, &req);
+        return Ok(vec![scene]);
+    }
+
+    if let Some(index) = options.sheet {
+        let total = sheets.len();
+        sheets.retain(|s| s.index == index);
+        if sheets.is_empty() {
+            return Err(format!("图纸编号 {index} 超出范围（共 {total} 张）"));
+        }
+    }
+
+    let mut scenes = Vec::with_capacity(sheets.len());
+    for sheet in &sheets {
+        // Aspect ratio picks the sheet; the frame's own size is what gets
+        // fitted, so the plot scale follows from the geometry alone.
+        let ratio = sheet.bounds.width() / sheet.bounds.height().max(f64::EPSILON);
+        let paper = if ratio >= 1.0 {
+            PaperSize::fit(297.0 * ratio, 297.0)
+        } else {
+            PaperSize::fit(297.0, 297.0 / ratio)
+        };
+        let req = PlotRequest {
+            window: sheet.bounds,
+            paper,
+            margin_mm: DEFAULT_MARGIN_MM,
+            mode: options.mode,
+        };
+        let (scene, _) = build(doc, &req);
+        scenes.push(scene);
+    }
+    Ok(scenes)
+}
+
+/// Convert to a PDF with one page per detected title-block frame (or a
+/// single page covering model extents when none are found), returning the
+/// page count.
+pub fn convert_to_pdf(
+    input: &Path,
+    output: &Path,
+    options: &ConvertOptions,
+) -> Result<usize, String> {
     let loaded = load(input)?;
-    let (scene, _report) = build_scene(&loaded.doc, mode)?;
-    let bytes = write_pdf(&[scene]);
-    fs::write(output, bytes).map_err(|error| format!("无法写入 PDF：{error}"))?;
-    Ok(1)
+    let scenes = scenes_for(&loaded.doc, options)?;
+    let bytes = write_pdf(&scenes);
+    fs::write(output, bytes).map_err(|e| format!("无法写入 PDF：{e}"))?;
+    Ok(scenes.len())
 }
 
 fn locate_converter() -> Result<PathBuf, String> {

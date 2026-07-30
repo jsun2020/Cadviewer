@@ -49,7 +49,8 @@ fn main() -> eframe::Result {
 }
 
 fn convert_file(input: &Path, output: &Path) -> Result<(), String> {
-    converter::convert_to_pdf(input, output, ColorMode::Color).map(|_pages| ())
+    let options = converter::ConvertOptions::default();
+    converter::convert_to_pdf(input, output, &options).map(|_pages| ())
 }
 
 fn show_error(message: &str) {
