@@ -8,3 +8,4 @@ pub mod fonts;
 pub mod geom;
 pub mod pdf;
 pub mod plot;
+pub mod render;
