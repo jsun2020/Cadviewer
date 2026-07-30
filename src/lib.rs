@@ -1,3 +1,4 @@
+pub mod aci;
 pub mod converter;
 pub mod dxf;
 pub mod encoding;
