@@ -3685,7 +3685,23 @@ git commit -m "feat: add tiny-skia screen renderer consuming PlotScene"
   - `converter::load(path: &Path) -> Result<LoadedDrawing, String>`
   - `converter::convert_to_pdf(path: &Path, output: &Path, mode: ColorMode) -> Result<usize, String>` returning the page count.
 
-The DWG hop now uses `-b` (binary DXF): 3.2 s and 22.9 MB versus 5.7 s and 41.7 MB for ASCII on the sample (PRD 3.8), and raw string bytes survive for per-string decoding.
+**The DWG hop uses ASCII DXF (`-y`, no `-b`).**
+
+The plan originally specified binary DXF for the speed win (3.2 s / 22.9 MB versus
+5.7 s / 41.7 MB). That was measured and then **disproved in practice**: LibreDWG's
+binary writer emits *name* fields (group codes 2, 8 — block names, layer names) as
+UTF-16LE, so `"ASHADE"` is stored as `41 00 53 00 ...`. A null-terminated read stops
+at the first `0x00` and yields `"A"`. Handles (code 5) and fixed keywords (code 0,
+100) are plain ASCII, which is why entity boundaries and record counts stayed
+correct and only the *names* were wrong — a failure that looks like nothing until
+you check the values.
+
+Empirically, on the real sample: ASCII DXF finds all 26 title-block inserts;
+binary DXF finds 0.
+
+The lexer keeps its binary support (tested, harmless, and correct for the shapes it
+does handle), but the converter must use ASCII. Do not reintroduce `-b` without
+first proving name fields round-trip on a real drawing.
 
 - [ ] **Step 1: Rewrite the converter**
 

@@ -11,13 +11,13 @@ fn sample_dwg() -> String {
     )
 }
 
-fn to_binary_dxf(dwg: &str, out: &Path) -> bool {
+fn to_dxf(dwg: &str, out: &Path) -> bool {
     let exe = Path::new("runtime").join("dwg2dxf.exe");
     if !exe.exists() {
         return false;
     }
     Command::new(exe)
-        .args(["-y", "-b", "-o"])
+        .args(["-y", "-o"])
         .arg(out)
         .arg(dwg)
         .output()
@@ -33,7 +33,7 @@ fn parses_the_reference_drawing() {
         return;
     }
     let tmp = std::env::temp_dir().join("cadviewer_phase1.dxf");
-    if !to_binary_dxf(&dwg, &tmp) {
+    if !to_dxf(&dwg, &tmp) {
         eprintln!("SKIPPED: runtime/dwg2dxf.exe unavailable");
         return;
     }
