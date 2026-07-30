@@ -48,6 +48,20 @@ pub struct Pair {
 #[derive(Clone, Copy, PartialEq)]
 enum Kind {
     Str,
+    /// Codes 310-319: "binary chunk" data. In binary DXF this is NOT a
+    /// null-terminated string like every other `Str` code — it is one
+    /// length byte followed by exactly that many raw bytes, which may
+    /// themselves contain `0x00`. Scanning it for a null terminator
+    /// desyncs every group code that follows. In ASCII DXF the same code
+    /// is just a line of hex-digit text, so it can be read like `Str`.
+    Chunk,
+    /// Codes 290-299: boolean flags. In binary DXF these are ONE byte,
+    /// not the two bytes a general 16-bit integer takes — treating them
+    /// as `I16` reads one byte too many and desyncs every group code
+    /// that follows (the real-drawing INSERT-name corruption, task 4
+    /// bugfix). In ASCII DXF the value is just the text "0" or "1", read
+    /// the same way as any other small integer.
+    Bool,
     F64,
     I16,
     I32,
@@ -66,8 +80,10 @@ fn kind_of(code: i32) -> Kind {
         170..=179 => Kind::I16,
         210..=239 => Kind::F64,
         270..=289 => Kind::I16,
-        290..=299 => Kind::I16,
-        300..=369 => Kind::Str,
+        290..=299 => Kind::Bool,
+        300..=309 => Kind::Str,
+        310..=319 => Kind::Chunk,
+        320..=369 => Kind::Str,
         370..=389 => Kind::I16,
         390..=399 => Kind::Str,
         400..=409 => Kind::I16,
@@ -79,7 +95,15 @@ fn kind_of(code: i32) -> Kind {
         460..=469 => Kind::F64,
         470..=479 => Kind::Str,
         999 => Kind::Str,
-        1000..=1009 => Kind::Str,
+        1000..=1003 => Kind::Str,
+        // Code 1004: XDATA "chunk of bytes". Same binary-chunk encoding as
+        // 310-319 (one length byte + N raw bytes, which may contain
+        // 0x00) — not a null-terminated string. Found by auditing the
+        // rest of this table for the same class of bug as 290/310 (task
+        // 4 bugfix); confirmed against the real drawing, where a single
+        // XDATA 1004 group desynced everything read after it.
+        1004 => Kind::Chunk,
+        1005..=1009 => Kind::Str,
         1010..=1059 => Kind::F64,
         1060..=1070 => Kind::I16,
         1071 => Kind::I32,
@@ -106,6 +130,25 @@ fn lex_binary(mut b: &[u8]) -> Result<Vec<Pair>, String> {
                 let s = b[..end].to_vec();
                 b = &b[(end + 1).min(b.len())..];
                 Value::Str(s)
+            }
+            Kind::Chunk => {
+                let Some((&len, rest)) = b.split_first() else {
+                    return Err(format!("binary DXF truncated at code {code}"));
+                };
+                let len = len as usize;
+                if rest.len() < len {
+                    return Err(format!("binary DXF truncated at code {code}"));
+                }
+                let s = rest[..len].to_vec();
+                b = &rest[len..];
+                Value::Str(s)
+            }
+            Kind::Bool => {
+                let Some((&flag, rest)) = b.split_first() else {
+                    return Err(format!("binary DXF truncated at code {code}"));
+                };
+                b = rest;
+                Value::I16(flag as i16)
             }
             Kind::F64 => {
                 if b.len() < 8 {
@@ -162,9 +205,11 @@ fn lex_ascii(bytes: &[u8]) -> Result<Vec<Pair>, String> {
         let Some(value_line) = lines.next() else { break };
         let raw = strip_cr(value_line);
         let value = match kind_of(code) {
-            Kind::Str => Value::Str(raw.to_vec()),
+            // ASCII DXF spells a binary chunk as one line of hex-digit
+            // text, so it needs no special-case reading here.
+            Kind::Str | Kind::Chunk => Value::Str(raw.to_vec()),
             Kind::F64 => Value::F64(parse_ascii(raw).unwrap_or(0.0)),
-            Kind::I16 => Value::I16(parse_ascii::<f64>(raw).unwrap_or(0.0) as i16),
+            Kind::Bool | Kind::I16 => Value::I16(parse_ascii::<f64>(raw).unwrap_or(0.0) as i16),
             Kind::I32 => Value::I32(parse_ascii::<f64>(raw).unwrap_or(0.0) as i32),
             Kind::I64 => Value::I64(parse_ascii::<f64>(raw).unwrap_or(0.0) as i64),
         };
@@ -243,5 +288,79 @@ mod tests {
         v.extend_from_slice(&[0xB2, 0xBC, 0xBE, 0xD6, 0x31, 0x00]);
         let pairs = lex(&v).expect("lex should succeed");
         assert_eq!(pairs[0].value.as_bytes(), Some(&[0xB2u8, 0xBC, 0xBE, 0xD6, 0x31][..]));
+    }
+
+    /// Regression test for the real-drawing bug: a group-290 boolean flag
+    /// is ONE byte in binary DXF, not the two bytes a general 16-bit
+    /// integer takes. Reading two bytes consumes the first byte of the
+    /// following record and desyncs everything after it — this is exactly
+    /// what corrupted every INSERT's group-2 block name in the sample
+    /// drawing (task 4 bugfix). Fails before the fix: the extra byte
+    /// consumed from the trailing code-0/"SECTION" record shifts the
+    /// following code and string, so pairs[1] would not read as
+    /// code 0 / "SECTION".
+    #[test]
+    fn binary_bool_is_one_byte() {
+        let mut v = Vec::new();
+        v.extend_from_slice(b"AutoCAD Binary DXF\r\n\x1a\x00");
+        v.extend_from_slice(&290u16.to_le_bytes());
+        v.push(1u8); // boolean flag, exactly one byte
+        v.extend_from_slice(&0u16.to_le_bytes());
+        v.extend_from_slice(b"SECTION\0");
+        let pairs = lex(&v).expect("lex should succeed");
+        assert_eq!(pairs[0].code, 290);
+        assert_eq!(pairs[0].value.as_i32(), Some(1));
+        assert_eq!(pairs[1].code, 0);
+        assert_eq!(pairs[1].value.as_bytes(), Some(&b"SECTION"[..]));
+    }
+
+    /// Regression test for the real-drawing bug: a group-310 binary chunk
+    /// is a one-byte length prefix followed by exactly that many raw
+    /// bytes, which may themselves contain 0x00. Scanning for a null
+    /// terminator (as ordinary `Str` codes do) truncates the chunk at the
+    /// first embedded zero and desyncs the stream — this is exactly what
+    /// corrupted the BLOCKS-section binary data in the sample drawing
+    /// (578 group-310 records). Fails before the fix: null-termination
+    /// would read only the byte before the embedded 0x00 as the chunk and
+    /// misplace everything after.
+    #[test]
+    fn binary_chunk_survives_embedded_nul() {
+        let mut v = Vec::new();
+        v.extend_from_slice(b"AutoCAD Binary DXF\r\n\x1a\x00");
+        v.extend_from_slice(&310u16.to_le_bytes());
+        let chunk = [0xDEu8, 0x00, 0xAD, 0xFF];
+        v.push(chunk.len() as u8); // one-byte length prefix
+        v.extend_from_slice(&chunk);
+        v.extend_from_slice(&0u16.to_le_bytes());
+        v.extend_from_slice(b"SECTION\0");
+        let pairs = lex(&v).expect("lex should succeed");
+        assert_eq!(pairs[0].code, 310);
+        assert_eq!(pairs[0].value.as_bytes(), Some(&chunk[..]));
+        assert_eq!(pairs[1].code, 0);
+        assert_eq!(pairs[1].value.as_bytes(), Some(&b"SECTION"[..]));
+    }
+
+    /// Regression test for a third mis-sized range found while auditing
+    /// `kind_of` against the DXF binary spec after the 290/310 fixes:
+    /// group 1004 (XDATA "chunk of bytes") uses the same length-prefixed
+    /// binary-chunk encoding as 310-319, not a null-terminated string.
+    /// The real drawing has exactly one 1004 group, and treating it as
+    /// `Str` desynced every group code read afterwards (confirmed via a
+    /// throwaway diagnostic dump against the actual sample DXF).
+    #[test]
+    fn xdata_binary_chunk_survives_embedded_nul() {
+        let mut v = Vec::new();
+        v.extend_from_slice(b"AutoCAD Binary DXF\r\n\x1a\x00");
+        v.extend_from_slice(&1004u16.to_le_bytes());
+        let chunk = [0x04u8, 0x00, 0x7a, 0xff];
+        v.push(chunk.len() as u8); // one-byte length prefix
+        v.extend_from_slice(&chunk);
+        v.extend_from_slice(&0u16.to_le_bytes());
+        v.extend_from_slice(b"SECTION\0");
+        let pairs = lex(&v).expect("lex should succeed");
+        assert_eq!(pairs[0].code, 1004);
+        assert_eq!(pairs[0].value.as_bytes(), Some(&chunk[..]));
+        assert_eq!(pairs[1].code, 0);
+        assert_eq!(pairs[1].value.as_bytes(), Some(&b"SECTION"[..]));
     }
 }
