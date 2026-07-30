@@ -1,6 +1,6 @@
 use std::f64::consts::TAU;
 
-use crate::dxfnew::entities::RawEntity;
+use crate::dxf::entities::RawEntity;
 use crate::geom::{Affine, PathGeom, Point, SubPath};
 
 /// Points used to approximate a full circle. Chosen so that the chord
@@ -214,7 +214,7 @@ fn polyline_points(entity: &RawEntity) -> Vec<Point> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dxfnew::lexer::Value;
+    use crate::dxf::lexer::Value;
 
     fn ent(kind: &str, codes: &[(i32, f64)]) -> RawEntity {
         RawEntity {

@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 
-use crate::dxfnew::entities::{RawEntity, read_blocks, read_section};
-use crate::dxfnew::lexer::lex;
-use crate::dxfnew::tables::{
+use crate::dxf::entities::{RawEntity, read_blocks, read_section};
+use crate::dxf::lexer::lex;
+use crate::dxf::tables::{
     HeaderVars, LayerRecord, LtypeRecord, read_header, read_layers, read_ltypes,
 };
 

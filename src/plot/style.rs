@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 
 use crate::aci::aci_rgb;
-use crate::dxfnew::entities::RawEntity;
-use crate::dxfnew::tables::{LayerRecord, LtypeRecord};
+use crate::dxf::entities::RawEntity;
+use crate::dxf::tables::{LayerRecord, LtypeRecord};
 use crate::encoding::Codepage;
 use crate::plot::Rgb;
 use crate::plot::{DEFAULT_WIDTH_MM, HAIRLINE_MM};
@@ -226,9 +226,9 @@ fn linetype_name(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dxfnew::entities::RawEntity;
-    use crate::dxfnew::lexer::Value;
-    use crate::dxfnew::tables::LayerRecord;
+    use crate::dxf::entities::RawEntity;
+    use crate::dxf::lexer::Value;
+    use crate::dxf::tables::LayerRecord;
 
     fn entity(codes: &[(i32, i32)]) -> RawEntity {
         RawEntity {
@@ -388,7 +388,7 @@ mod tests {
         }
     }
 
-    use crate::dxfnew::tables::LtypeRecord;
+    use crate::dxf::tables::LtypeRecord;
     use std::collections::HashMap;
 
     fn ltypes() -> HashMap<String, LtypeRecord> {

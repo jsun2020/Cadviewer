@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use crate::dxfnew::lexer::{Pair, Value};
+use crate::dxf::lexer::{Pair, Value};
 use crate::encoding::{Codepage, decode};
 use crate::geom::Point;
 

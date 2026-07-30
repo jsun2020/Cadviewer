@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use crate::doc::Document;
-use crate::dxfnew::entities::RawEntity;
+use crate::dxf::entities::RawEntity;
 use crate::geom::{Affine, Bounds, Point};
 use crate::plot::flatten::flatten;
 use crate::plot::style::{

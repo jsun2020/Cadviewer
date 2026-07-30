@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use crate::dxfnew::lexer::Pair;
+use crate::dxf::lexer::Pair;
 use crate::encoding::{Codepage, codepage_from_dxf, decode};
 use crate::geom::Point;
 
@@ -172,7 +172,7 @@ pub fn read_ltypes(pairs: &[Pair], cp: Codepage) -> HashMap<String, LtypeRecord>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dxfnew::lexer::lex;
+    use crate::dxf::lexer::lex;
     use crate::encoding::Codepage;
 
     const SRC: &[u8] = b"  0\nSECTION\n  2\nHEADER\n  9\n$DWGCODEPAGE\n  3\nANSI_936\n  9\n$LTSCALE\n 40\n10.0\n  9\n$CELWEIGHT\n370\n25\n  0\nENDSEC\n  0\nSECTION\n  2\nTABLES\n  0\nTABLE\n  2\nLAYER\n  0\nLAYER\n  2\nWALL\n 62\n4\n370\n35\n  6\nHIDDEN\n  0\nLAYER\n  2\nTHIN\n 62\n8\n370\n-3\n  6\nCONTINUOUS\n  0\nENDTAB\n  0\nTABLE\n  2\nLTYPE\n  0\nLTYPE\n  2\nHIDDEN\n 73\n2\n 49\n6.35\n 49\n-3.175\n  0\nENDTAB\n  0\nENDSEC\n";
