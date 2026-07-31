@@ -2,13 +2,13 @@ use std::collections::HashMap;
 
 use crate::doc::Document;
 use crate::dxf::entities::RawEntity;
-use crate::geom::{Affine, Bounds, Point};
+use crate::geom::{Affine, Bounds, PathGeom, Point, SubPath};
 use crate::plot::flatten::flatten;
 use crate::plot::style::{
     ColorMode, Inherited, resolve_color, resolve_dash_mm, resolve_linetype_name, resolve_raw_width,
     resolve_width_mm,
 };
-use crate::plot::{PaperSize, PlotItem, PlotScene, StrokeStyle};
+use crate::plot::{GlyphRun, PaperSize, PlotItem, PlotScene, StrokeStyle};
 
 /// Guards against self-referential blocks, which do occur in damaged files.
 const MAX_BLOCK_DEPTH: usize = 24;
@@ -87,7 +87,20 @@ fn plot_transform(req: &PlotRequest) -> (Affine, f64) {
 }
 
 pub fn build(doc: &Document, req: &PlotRequest) -> (PlotScene, BuildReport) {
-    build_within(doc, req, MAX_EXPANDED_ENTITIES)
+    build_with_text(doc, req, None)
+}
+
+/// [`build`], plus a text engine.
+///
+/// `None` means text is not drawn and TEXT/MTEXT/ATTRIB are reported as
+/// skipped — the Phase 3 behaviour, kept so the geometry tests and any
+/// caller that has no font search stay exactly as they were.
+pub fn build_with_text(
+    doc: &Document,
+    req: &PlotRequest,
+    text: Option<&mut crate::text::TextEngine>,
+) -> (PlotScene, BuildReport) {
+    build_within(doc, req, MAX_EXPANDED_ENTITIES, text)
 }
 
 /// [`build`] with an explicit expansion budget, so the truncation path can
@@ -97,6 +110,7 @@ pub(crate) fn build_within(
     doc: &Document,
     req: &PlotRequest,
     budget: usize,
+    mut text: Option<&mut crate::text::TextEngine>,
 ) -> (PlotScene, BuildReport) {
     let (transform, scale) = plot_transform(req);
     let mut scene = PlotScene::new(req.paper);
@@ -111,7 +125,19 @@ pub(crate) fn build_within(
             *report.skipped.entry("图纸空间实体".to_owned()).or_default() += 1;
             continue;
         }
-        emit(doc, ent, transform, scale, req, &inherited, 0, budget, &mut scene, &mut report);
+        emit(
+            doc,
+            ent,
+            transform,
+            scale,
+            req,
+            &inherited,
+            0,
+            budget,
+            &mut scene,
+            &mut report,
+            &mut text,
+        );
     }
     report.items = scene.items.len();
     (scene, report)
@@ -140,6 +166,7 @@ fn emit(
     budget: usize,
     scene: &mut PlotScene,
     report: &mut BuildReport,
+    text: &mut Option<&mut crate::text::TextEngine>,
 ) {
     if depth > MAX_BLOCK_DEPTH {
         *report.skipped.entry("超出块嵌套深度".to_owned()).or_default() += 1;
@@ -189,8 +216,77 @@ fn emit(
         };
         for local in placements {
             for child_ent in &block.entities {
-                emit(doc, child_ent, local, scale, req, &child, depth + 1, budget, scene, report);
+                emit(
+                    doc,
+                    child_ent,
+                    local,
+                    scale,
+                    req,
+                    &child,
+                    depth + 1,
+                    budget,
+                    scene,
+                    report,
+                    text,
+                );
             }
+        }
+        return;
+    }
+
+    // R-TXT-3.4: ATTDEF is the attribute *definition* — a template
+    // AutoCAD does not plot. Returning here keeps it out of both the
+    // scene and the unsupported-entity report.
+    if ent.kind == "ATTDEF" {
+        return;
+    }
+
+    if matches!(ent.kind.as_str(), "TEXT" | "MTEXT" | "ATTRIB") {
+        let Some(engine) = text.as_deref_mut() else {
+            *report.skipped.entry(ent.kind.clone()).or_default() += 1;
+            return;
+        };
+        let layer = doc.layer(&ent.layer(cp));
+        if !plotted(layer, report) {
+            return;
+        }
+        let Some(laid) = engine.lay_out(ent) else {
+            *report.skipped.entry(ent.kind.clone()).or_default() += 1;
+            return;
+        };
+        let color = resolve_color(ent, layer, inherited.color, req.mode);
+        // R-TXT-4.4: the stroke width is whatever R-LW resolved for this
+        // entity. Text does not get a width of its own.
+        let width_mm = resolve_width_mm(ent, layer, inherited.lineweight, doc.header.celweight);
+        for (contours, fill) in [(laid.stroked, false), (laid.filled, true)] {
+            if contours.is_empty() {
+                continue;
+            }
+            let geom = PathGeom {
+                subpaths: contours
+                    .into_iter()
+                    .map(|points| SubPath {
+                        points: points.into_iter().map(|p| transform.apply(p)).collect(),
+                        closed: fill,
+                    })
+                    .collect(),
+            };
+            // Same cull as every other entity: an off-page run costs one
+            // bounds comparison, not a content-stream entry.
+            let b = geom.bounds();
+            if !b.valid()
+                || b.max_x < 0.0
+                || b.min_x > req.paper.width_mm
+                || b.max_y < 0.0
+                || b.min_y > req.paper.height_mm
+            {
+                continue;
+            }
+            scene.items.push(PlotItem::Glyphs(GlyphRun {
+                geom,
+                style: StrokeStyle { color, width_mm, dash_mm: None },
+                fill,
+            }));
         }
         return;
     }
@@ -408,6 +504,7 @@ mod tests {
         let bounds_of = |item: &PlotItem| match item {
             PlotItem::Path { geom, .. } => geom.bounds(),
             PlotItem::Fill { geom, .. } => geom.bounds(),
+            PlotItem::Glyphs(run) => run.geom.bounds(),
         };
         let a = bounds_of(&scene.items[0]);
         let b = bounds_of(&scene.items[1]);
@@ -480,7 +577,7 @@ mod tests {
     fn a_self_referential_block_is_truncated_and_reported() {
         let src = b"  0\nSECTION\n  2\nBLOCKS\n  0\nBLOCK\n  2\nBOMB\n 10\n0.0\n 20\n0.0\n  0\nLINE\n  8\n0\n 10\n0.0\n 20\n0.0\n 11\n10.0\n 21\n10.0\n  0\nINSERT\n  8\n0\n  2\nBOMB\n 10\n0.0\n 20\n0.0\n  0\nINSERT\n  8\n0\n  2\nBOMB\n 10\n1.0\n 20\n1.0\n  0\nENDBLK\n  0\nENDSEC\n  0\nSECTION\n  2\nENTITIES\n  0\nINSERT\n  8\n0\n  2\nBOMB\n 10\n0.0\n 20\n0.0\n  0\nENDSEC\n  0\nEOF\n";
         let doc = Document::parse(src).unwrap();
-        let (scene, report) = build_within(&doc, &request(100.0, 100.0), 5_000);
+        let (scene, report) = build_within(&doc, &request(100.0, 100.0), 5_000, None);
         assert!(report.truncated, "the expansion budget must fire");
         assert!(report.expanded <= 5_001, "budget overrun: {}", report.expanded);
         assert!(scene.items.len() < 5_001, "got {} items", scene.items.len());
@@ -536,5 +633,28 @@ mod tests {
         let b = model_extents(&doc);
         assert!(b.valid());
         assert!(b.width() >= 100.0, "width {}", b.width());
+    }
+
+    /// Without an engine, text stays exactly where Phase 3 left it: counted
+    /// as skipped rather than silently dropped, so the report still tells
+    /// the truth about what is missing from the page.
+    #[test]
+    fn text_is_reported_as_skipped_when_no_engine_is_supplied() {
+        let src = b"  0\nSECTION\n  2\nENTITIES\n  0\nTEXT\n  8\n0\n  1\nABC\n 40\n10.0\n 10\n10.0\n 20\n10.0\n  0\nENDSEC\n  0\nEOF\n";
+        let doc = Document::parse(src).unwrap();
+        let (scene, report) = build(&doc, &request(100.0, 100.0));
+        assert!(scene.items.is_empty());
+        assert_eq!(report.skipped.get("TEXT"), Some(&1));
+    }
+
+    /// ATTDEF is a template AutoCAD does not plot, so it is neither drawn
+    /// nor an unsupported-entity complaint (R-TXT-3.4).
+    #[test]
+    fn attdefs_are_neither_drawn_nor_counted_as_unsupported() {
+        let src = b"  0\nSECTION\n  2\nENTITIES\n  0\nATTDEF\n  8\n0\n  1\nTAG\n 40\n10.0\n 10\n10.0\n 20\n10.0\n  0\nENDSEC\n  0\nEOF\n";
+        let doc = Document::parse(src).unwrap();
+        let (scene, report) = build(&doc, &request(100.0, 100.0));
+        assert!(scene.items.is_empty());
+        assert_eq!(report.skipped.get("ATTDEF"), None, "{:?}", report.skipped);
     }
 }

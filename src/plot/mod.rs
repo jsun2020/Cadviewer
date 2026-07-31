@@ -38,10 +38,27 @@ pub struct StrokeStyle {
     pub dash_mm: Option<Vec<f32>>,
 }
 
+/// One laid-out run of text, already in paper millimetres.
+///
+/// The outlines are always populated, so a backend can draw text without
+/// knowing anything about fonts — which is what keeps the screen and the
+/// PDF from growing two different typesetters (R-TXT-4.3).
+#[derive(Clone, Debug)]
+pub struct GlyphRun {
+    pub geom: PathGeom,
+    /// Colour and width come from the entity, exactly as for any other
+    /// item: R-TXT-4.4 forbids a separate constant for text.
+    pub style: StrokeStyle,
+    /// SHX is a stroke font, so its outlines are stroked at the entity's
+    /// lineweight. TrueType contours are closed and must be filled.
+    pub fill: bool,
+}
+
 #[derive(Clone, Debug)]
 pub enum PlotItem {
     Path { geom: PathGeom, style: StrokeStyle },
     Fill { geom: PathGeom, color: Rgb },
+    Glyphs(GlyphRun),
 }
 
 #[derive(Clone, Copy, Debug)]

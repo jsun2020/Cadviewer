@@ -115,6 +115,8 @@ fn draw_into(
                     clip.as_ref(),
                 );
             }
+            // Task 12 draws glyph runs; Task 11 only wires the enum through.
+            PlotItem::Glyphs(_) => {}
         }
     }
 }

@@ -133,6 +133,8 @@ fn build_content(scene: &PlotScene) -> String {
                 emit_path(&mut out, geom);
                 let _ = writeln!(out, "f");
             }
+            // Task 12 draws glyph runs; Task 11 only wires the enum through.
+            PlotItem::Glyphs(_) => {}
         }
     }
 
