@@ -40,6 +40,29 @@ pub fn decode(bytes: &[u8], cp: Codepage) -> String {
     decoded.into_owned()
 }
 
+/// The multi-byte code a big font indexes this character by.
+///
+/// `Document` hands out decoded Rust strings, but `gbcbig.shx` is keyed by
+/// the character's codepage bytes: 图 is glyph `0xCDBC` because `CD BC` is
+/// its GBK encoding. Returns `None` for anything that encodes to a single
+/// byte (which belongs to the primary font) or that the codepage cannot
+/// represent at all.
+pub fn bigfont_code(ch: char, cp: Codepage) -> Option<u16> {
+    let encoding = match cp {
+        Codepage::Gbk => encoding_rs::GBK,
+        Codepage::Big5 => encoding_rs::BIG5,
+        // A UTF-8 or Latin-1 drawing has no double-byte codes to look up.
+        Codepage::Utf8 | Codepage::Latin1 => return None,
+    };
+    let mut buffer = [0u8; 4];
+    let text = ch.encode_utf8(&mut buffer);
+    let (bytes, _, had_errors) = encoding.encode(text);
+    if had_errors || bytes.len() != 2 {
+        return None;
+    }
+    Some(u16::from(bytes[0]) << 8 | u16::from(bytes[1]))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -81,5 +104,29 @@ mod tests {
         let out = decode(bytes, Codepage::Gbk);
         assert!(out.starts_with("230626-"), "got {out:?}");
         assert!(out.ends_with("JC$0$DOTE"), "got {out:?}");
+    }
+
+    /// A bigfont indexes glyphs by the character's codepage bytes, not by
+    /// its Unicode scalar: 图 is glyph 0xCDBC in gbcbig.shx because CD BC
+    /// is its GBK encoding. Looking it up as U+56FE finds nothing and the
+    /// character silently vanishes from the page.
+    #[test]
+    fn bigfont_codes_come_from_the_drawings_codepage() {
+        assert_eq!(bigfont_code('图', Codepage::Gbk), Some(0xCDBC));
+        assert_eq!(bigfont_code('纸', Codepage::Gbk), Some(0xD6BD));
+        assert_eq!(bigfont_code('一', Codepage::Gbk), Some(0xD2BB));
+    }
+
+    #[test]
+    fn single_byte_characters_have_no_bigfont_code() {
+        assert_eq!(bigfont_code('A', Codepage::Gbk), None);
+        assert_eq!(bigfont_code('7', Codepage::Gbk), None);
+    }
+
+    /// A character the codepage cannot represent must report that rather
+    /// than encode to a replacement byte that indexes the wrong glyph.
+    #[test]
+    fn characters_outside_the_codepage_have_no_code() {
+        assert_eq!(bigfont_code('\u{1F600}', Codepage::Gbk), None);
     }
 }
