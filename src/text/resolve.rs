@@ -32,7 +32,8 @@ pub struct Substitution {
 /// `gbcbig.shx` ships with every AutoCAD, is a genuine stroke font, and
 /// therefore sits beside the drawing's Latin SHX text without the visible
 /// mismatch a TrueType swap produces. That is why the chain prefers it to
-/// any TTF (PRD 5.6.2).
+/// any TTF (PRD 5.6.2). `hztxt.shx` is listed after `gbcbig.shx` as a
+/// fallback for machines that may have the third-party font.
 const BIGFONT_SUBSTITUTES: [&str; 2] = ["gbcbig.shx", "hztxt.shx"];
 
 /// Stroke fonts tried, in order, when a single-byte font is missing.
@@ -89,8 +90,21 @@ impl Resolver {
             return match role {
                 // A style with no big font simply has none.
                 Role::Bigfont => Resolved::None,
-                // A style with no primary font is drawn with txt.shx.
-                Role::Primary => self.locate(UNNAMED_PRIMARY_DEFAULT).unwrap_or(Resolved::None),
+                // A style with no primary font is drawn with txt.shx. That
+                // default is not a substitution and must not warn — but if
+                // even the default is absent, the style draws nothing, and
+                // silence there is the failure R-TXT-2.3 forbids.
+                Role::Primary => match self.locate(UNNAMED_PRIMARY_DEFAULT) {
+                    Some(found) => found,
+                    None => {
+                        self.substitutions.push(Substitution {
+                            requested: UNNAMED_PRIMARY_DEFAULT.to_owned(),
+                            role,
+                            used: Resolved::None,
+                        });
+                        Resolved::None
+                    }
+                },
             };
         }
 
@@ -104,6 +118,7 @@ impl Resolver {
             if role == Role::Bigfont { &BIGFONT_SUBSTITUTES } else { &PRIMARY_SUBSTITUTES };
         let mut used = Resolved::None;
         for candidate in chain {
+            // Avoid a redundant re-scan of a font already proven to be missing.
             if candidate.eq_ignore_ascii_case(trimmed) {
                 continue;
             }
@@ -195,9 +210,10 @@ mod tests {
     }
 
     /// R-TXT-2.2 rule 2: a missing primary prefers simplex, then txt.
+    /// Ordering is pinned by including a TTF that must not be chosen.
     #[test]
     fn a_missing_primary_substitutes_simplex_then_txt() {
-        let dir = dir_with(&["simplex.shx", "txt.shx"]);
+        let dir = dir_with(&["simplex.shx", "txt.shx", "simsun.ttc"]);
         let mut r = resolver(&dir);
         let Resolved::Shx(path) = r.resolve("yjkeng.shx", Role::Primary) else { panic!() };
         assert!(path.ends_with("simplex.shx"), "got {path:?}");
@@ -231,14 +247,22 @@ mod tests {
     }
 
     /// An empty group 3 is "no font named", which AutoCAD draws with
-    /// txt.shx. That is a default, not a substitution.
+    /// txt.shx: a default, not a substitution, so it must not warn. But if
+    /// even txt.shx is absent — the normal state of a machine with no CAD
+    /// product installed — the style draws nothing, and that must not happen
+    /// in silence.
     #[test]
-    fn an_unnamed_primary_font_defaults_to_txt_without_a_warning() {
-        let dir = dir_with(&["txt.shx"]);
-        let mut r = resolver(&dir);
-        let Resolved::Shx(path) = r.resolve("", Role::Primary) else { panic!() };
-        assert!(path.ends_with("txt.shx"));
-        assert!(r.substitutions().is_empty());
+    fn an_unnamed_primary_warns_only_when_even_the_default_is_missing() {
+        let present = dir_with(&["txt.shx"]);
+        let mut r = resolver(&present);
+        assert!(matches!(r.resolve("", Role::Primary), Resolved::Shx(_)));
+        assert!(r.substitutions().is_empty(), "the default must not warn: {:?}", r.substitutions());
+
+        let empty = dir_with(&[]);
+        let mut r = resolver(&empty);
+        assert_eq!(r.resolve("", Role::Primary), Resolved::None);
+        assert_eq!(r.substitutions().len(), 1, "a missing default must not be silent");
+        assert!(r.substitutions()[0].describe().contains("txt.shx"));
     }
 
     /// An empty group 4 means the style simply has no big font. It must
