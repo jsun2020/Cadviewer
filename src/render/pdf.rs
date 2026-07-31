@@ -133,8 +133,47 @@ fn build_content(scene: &PlotScene) -> String {
                 emit_path(&mut out, geom);
                 let _ = writeln!(out, "f");
             }
-            // Task 12 draws glyph runs; Task 11 only wires the enum through.
-            PlotItem::Glyphs(_) => {}
+            PlotItem::Glyphs(run) => {
+                if run.fill {
+                    // TrueType contours are closed areas, so they are filled
+                    // rather than stroked — outlining them would draw hollow
+                    // letters (R-TXT-4.1/4.2).
+                    if current_fill != Some(run.style.color) {
+                        let _ = writeln!(
+                            out,
+                            "{} {} {} rg",
+                            fmt_channel(channel(run.style.color.r)),
+                            fmt_channel(channel(run.style.color.g)),
+                            fmt_channel(channel(run.style.color.b))
+                        );
+                        current_fill = Some(run.style.color);
+                    }
+                    emit_path(&mut out, &run.geom);
+                    let _ = writeln!(out, "f");
+                } else {
+                    // The graphics-state trackers are shared with the arms
+                    // above on purpose: a run that changed the colour without
+                    // recording it would leave the next path drawn in the
+                    // wrong colour.
+                    apply_stroke(
+                        &mut out,
+                        &run.style,
+                        &mut current_stroke,
+                        &mut current_width,
+                        &mut current_dash,
+                    );
+                    // Round caps and joins for stroke fonts, bracketed so the
+                    // page keeps its butt-cap default for geometry. Colour,
+                    // width and dash are set *before* the `q`, so they are
+                    // part of the saved state and survive the `Q` unchanged —
+                    // the trackers stay accurate. Anything moved inside this
+                    // bracket would have to invalidate them.
+                    let _ = writeln!(out, "q 1 J 1 j");
+                    emit_path(&mut out, &run.geom);
+                    let _ = writeln!(out, "S");
+                    let _ = writeln!(out, "Q");
+                }
+            }
         }
     }
 
@@ -386,5 +425,62 @@ mod tests {
             raw.len(),
             compressed.len()
         );
+    }
+
+    fn glyph_scene(fill: bool) -> PlotScene {
+        let mut s = PlotScene::new(PaperSize::a4_landscape());
+        s.items.push(PlotItem::Glyphs(crate::plot::GlyphRun {
+            geom: PathGeom {
+                subpaths: vec![SubPath {
+                    points: vec![
+                        Point::new(10.0, 10.0),
+                        Point::new(60.0, 10.0),
+                        Point::new(60.0, 40.0),
+                    ],
+                    closed: fill,
+                }],
+            },
+            style: StrokeStyle { color: Rgb::new(0, 0, 255), width_mm: 0.35, dash_mm: None },
+            fill,
+        }));
+        s
+    }
+
+    #[test]
+    fn a_stroked_glyph_run_emits_a_stroke_operator() {
+        let text = decompressed_content(&write_pdf(&[glyph_scene(false)]));
+        assert!(text.contains("0 0 1 RG"), "the text colour is missing: {text}");
+        assert!(text.lines().any(|l| l.trim() == "S"), "no stroke operator: {text}");
+    }
+
+    /// R-TXT-4.1/4.2: SHX text is stroked, TrueType text is filled. A
+    /// filled run stroked instead would draw hollow letters.
+    #[test]
+    fn a_filled_glyph_run_emits_a_fill_operator() {
+        let text = decompressed_content(&write_pdf(&[glyph_scene(true)]));
+        assert!(text.lines().any(|l| l.trim() == "f"), "no fill operator: {text}");
+        assert!(text.contains("0 0 1 rg"), "the fill colour is missing: {text}");
+    }
+
+    /// Stroke fonts get round caps and joins, and only they do: a `q`/`Q`
+    /// bracket keeps the page's butt-cap default for geometry.
+    #[test]
+    fn stroked_text_gets_round_caps_without_disturbing_geometry() {
+        let text = decompressed_content(&write_pdf(&[glyph_scene(false)]));
+        assert!(text.contains("q 1 J 1 j"), "text was drawn with the page's butt caps: {text}");
+        let geometry = decompressed_content(&write_pdf(&[line_scene(0.35)]));
+        assert!(!geometry.contains("1 J"), "geometry must keep butt caps: {geometry}");
+    }
+
+    /// The colour, width and dash a run sets must be emitted *before* its
+    /// `q`, so `Q` restores them to the same values and the shared trackers
+    /// stay accurate. Moving `apply_stroke` inside the bracket would make
+    /// the next path inherit whatever state preceded the text.
+    #[test]
+    fn text_graphics_state_is_set_outside_the_cap_bracket() {
+        let text = decompressed_content(&write_pdf(&[glyph_scene(false)]));
+        let colour = text.find("0 0 1 RG").expect("no stroke colour");
+        let bracket = text.find("q 1 J 1 j").expect("no cap bracket");
+        assert!(colour < bracket, "the colour is inside the q/Q bracket: {text}");
     }
 }

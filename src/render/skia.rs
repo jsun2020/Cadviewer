@@ -115,8 +115,37 @@ fn draw_into(
                     clip.as_ref(),
                 );
             }
-            // Task 12 draws glyph runs; Task 11 only wires the enum through.
-            PlotItem::Glyphs(_) => {}
+            PlotItem::Glyphs(run) => {
+                let Some(path) = build_path(&run.geom) else { continue };
+                if run.fill {
+                    // TrueType contours are closed areas. Non-zero winding
+                    // is what leaves the counters inside 'o' and 'B' open.
+                    pixmap.fill_path(
+                        &path,
+                        &paint_for(run.style.color),
+                        tiny_skia::FillRule::Winding,
+                        transform,
+                        clip.as_ref(),
+                    );
+                } else {
+                    // Round caps and joins, unlike the mitre joins geometry
+                    // uses: SHX is a pen-plotter font whose strokes meet at
+                    // sharp angles, and mitres spike at them.
+                    let stroke = Stroke {
+                        width: (run.style.width_mm * pixels_per_mm).max(1.0) / pixels_per_mm,
+                        line_cap: LineCap::Round,
+                        line_join: LineJoin::Round,
+                        ..Stroke::default()
+                    };
+                    pixmap.stroke_path(
+                        &path,
+                        &paint_for(run.style.color),
+                        &stroke,
+                        transform,
+                        clip.as_ref(),
+                    );
+                }
+            }
         }
     }
 }
@@ -322,6 +351,40 @@ mod tests {
         let shifted = render_window(&scene, 2.0, 30.0, 0.0, 200, 200).unwrap();
         assert_eq!(marked_col(&unshifted, 100), Some(20));
         assert_eq!(marked_col(&shifted, 100), Some(0));
+    }
+
+    fn glyph_scene(fill: bool) -> PlotScene {
+        let mut s = PlotScene::new(PaperSize { width_mm: 100.0, height_mm: 100.0 });
+        s.items.push(PlotItem::Glyphs(crate::plot::GlyphRun {
+            geom: PathGeom {
+                subpaths: vec![SubPath {
+                    points: vec![
+                        Point::new(20.0, 20.0),
+                        Point::new(80.0, 20.0),
+                        Point::new(80.0, 80.0),
+                        Point::new(20.0, 80.0),
+                    ],
+                    closed: fill,
+                }],
+            },
+            style: StrokeStyle { color: Rgb::BLACK, width_mm: 0.5, dash_mm: None },
+            fill,
+        }));
+        s
+    }
+
+    #[test]
+    fn stroked_glyph_runs_are_drawn() {
+        let pm = render(&glyph_scene(false), 4.0);
+        assert!(non_white_pixels(&pm) > 100, "SHX text was not drawn");
+    }
+
+    /// A filled run covers its interior; a stroked one only its outline.
+    #[test]
+    fn filled_glyph_runs_cover_more_than_stroked_ones() {
+        let stroked = non_white_pixels(&render(&glyph_scene(false), 4.0));
+        let filled = non_white_pixels(&render(&glyph_scene(true), 4.0));
+        assert!(filled > stroked * 4, "stroked {stroked}, filled {filled}");
     }
 
     #[test]
