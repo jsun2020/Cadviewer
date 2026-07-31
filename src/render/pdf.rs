@@ -1,11 +1,14 @@
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::io::Write as _;
 
 use flate2::Compression;
 use flate2::write::ZlibEncoder;
-use pdf_writer::{Filter, Finish, Pdf, Rect, Ref};
+use pdf_writer::types::{CidFontType, FontFlags, SystemInfo, UnicodeCmap};
+use pdf_writer::{Filter, Finish, Name, Pdf, Rect, Ref, Str};
 
 use crate::plot::{PlotItem, PlotScene, Rgb, StrokeStyle};
+use crate::text::ttf::FaceKey;
 
 const MM_TO_PT: f64 = 72.0 / 25.4;
 
@@ -26,6 +29,35 @@ fn fmt_channel(v: f32) -> String {
     if trimmed.is_empty() { "0".to_owned() } else { trimmed.to_owned() }
 }
 
+/// A face embedded in this document, with the object ids reserved for it.
+struct FontEntry {
+    face: crate::render::embed::EmbeddedFace,
+    /// Name in the page `/Font` dictionary and in the `Tf` operator.
+    resource: String,
+    type0_id: Ref,
+    cid_id: Ref,
+    descriptor_id: Ref,
+    file_id: Ref,
+    to_unicode_id: Ref,
+}
+
+/// Which characters each TrueType face has to be able to show.
+///
+/// Collected across every page first, so a face used on twenty sheets is
+/// read, subset and embedded once rather than twenty times.
+fn faces_used(scenes: &[PlotScene]) -> BTreeMap<FaceKey, BTreeSet<char>> {
+    let mut wanted: BTreeMap<FaceKey, BTreeSet<char>> = BTreeMap::new();
+    for scene in scenes {
+        for item in &scene.items {
+            let PlotItem::Glyphs(run) = item else { continue };
+            for span in &run.text {
+                wanted.entry(span.face.as_ref().clone()).or_default().extend(span.text.chars());
+            }
+        }
+    }
+    wanted
+}
+
 /// Render one scene per page into a single PDF document.
 pub fn write_pdf(scenes: &[PlotScene]) -> Vec<u8> {
     let mut pdf = Pdf::new();
@@ -39,6 +71,26 @@ pub fn write_pdf(scenes: &[PlotScene]) -> Vec<u8> {
         page_ids.push(Ref::new(next));
         content_ids.push(Ref::new(next + 1));
         next += 2;
+    }
+
+    // Faces that could not be read, parsed or subset simply do not appear
+    // here, and every run that wanted one falls back to its outlines.
+    let mut fonts: BTreeMap<FaceKey, FontEntry> = BTreeMap::new();
+    for (index, (key, chars)) in faces_used(scenes).into_iter().enumerate() {
+        let Some(face) = crate::render::embed::embed(&key, &chars) else { continue };
+        fonts.insert(
+            key,
+            FontEntry {
+                face,
+                resource: format!("F{index}"),
+                type0_id: Ref::new(next),
+                cid_id: Ref::new(next + 1),
+                descriptor_id: Ref::new(next + 2),
+                file_id: Ref::new(next + 3),
+                to_unicode_id: Ref::new(next + 4),
+            },
+        );
+        next += 5;
     }
 
     pdf.catalog(catalog_id).pages(page_tree_id);
@@ -59,15 +111,100 @@ pub fn write_pdf(scenes: &[PlotScene]) -> Vec<u8> {
         // /Resources is a required inheritable page attribute (PDF 1.7
         // 7.7.3.3). Viewers tolerate its absence; strict preflight and
         // PDF/A do not, and nothing in /Pages supplies it.
-        page.resources();
+        let mut resources = page.resources();
+        if !fonts.is_empty() {
+            let mut dict = resources.fonts();
+            for entry in fonts.values() {
+                dict.pair(Name(entry.resource.as_bytes()), entry.type0_id);
+            }
+            dict.finish();
+        }
+        resources.finish();
         page.finish();
 
-        let stream = build_content(scene);
+        let stream = build_content(scene, &fonts);
         let compressed = deflate(stream.as_bytes());
         pdf.stream(content_ids[i], &compressed).filter(Filter::FlateDecode);
     }
 
+    for entry in fonts.values() {
+        write_font(&mut pdf, entry);
+    }
+
     pdf.finish()
+}
+
+/// Identity ordering: the codes in the content stream are glyph ids in the
+/// embedded subset, not characters in any character collection. `/ToUnicode`
+/// is what carries the meaning back to a reader.
+const IDENTITY: SystemInfo<'static> =
+    SystemInfo { registry: Str(b"Adobe"), ordering: Str(b"Identity"), supplement: 0 };
+
+fn write_font(pdf: &mut Pdf, entry: &FontEntry) {
+    let face = &entry.face;
+    let base = Name(face.base_name.as_bytes());
+
+    pdf.type0_font(entry.type0_id)
+        .base_font(base)
+        // Two-byte codes taken straight as CIDs, which with the identity
+        // CID-to-GID map below means the codes are subset glyph ids.
+        .encoding_predefined(Name(b"Identity-H"))
+        .descendant_font(entry.cid_id)
+        .to_unicode(entry.to_unicode_id);
+
+    let mut cid = pdf.cid_font(entry.cid_id);
+    cid.subtype(CidFontType::Type2)
+        .base_font(base)
+        .system_info(IDENTITY)
+        .font_descriptor(entry.descriptor_id)
+        .cid_to_gid_map_predefined(Name(b"Identity"))
+        .default_width(0.0);
+    {
+        let mut widths = cid.widths();
+        for (gid, width) in &face.widths {
+            widths.consecutive(*gid, [*width]);
+        }
+        widths.finish();
+    }
+    cid.finish();
+
+    let mut flags = FontFlags::SYMBOLIC;
+    if face.is_serif_guess {
+        flags |= FontFlags::SERIF;
+    }
+    if face.italic_angle != 0.0 {
+        flags |= FontFlags::ITALIC;
+    }
+    pdf.font_descriptor(entry.descriptor_id)
+        .name(base)
+        .flags(flags)
+        .bbox(Rect::new(face.bbox[0], face.bbox[1], face.bbox[2], face.bbox[3]))
+        .italic_angle(face.italic_angle)
+        .ascent(face.ascent)
+        .descent(face.descent)
+        .cap_height(face.cap_height)
+        // Required, and only ever an approximation for a face we did not
+        // author; readers use it for synthetic bolding, which this never
+        // asks for.
+        .stem_v(80.0)
+        .font_file2(entry.file_id);
+
+    let compressed = deflate(&face.program);
+    pdf.stream(entry.file_id, &compressed).filter(Filter::FlateDecode);
+
+    let mut cmap = UnicodeCmap::new(Name(b"Custom"), IDENTITY);
+    // One entry per glyph. Two characters sharing a glyph — a face that maps
+    // them to the same shape — can only be reported as one of them, and the
+    // first is as good an answer as the reader can get.
+    let mut seen = BTreeSet::new();
+    for (ch, gid) in &face.glyphs {
+        if seen.insert(*gid) {
+            cmap.pair(*gid, *ch);
+        }
+    }
+    let bytes = cmap.finish();
+    let compressed = deflate(&bytes);
+    pdf.cmap(entry.to_unicode_id, &compressed).filter(Filter::FlateDecode);
 }
 
 /// Zlib-compress (RFC 1950) a content stream for `/Filter /FlateDecode`.
@@ -86,7 +223,7 @@ fn deflate(bytes: &[u8]) -> Vec<u8> {
         .expect("finishing an in-memory Vec encoder cannot fail")
 }
 
-fn build_content(scene: &PlotScene) -> String {
+fn build_content(scene: &PlotScene, fonts: &BTreeMap<FaceKey, FontEntry>) -> String {
     let mut out = String::new();
     let mut current_stroke: Option<Rgb> = None;
     let mut current_fill: Option<Rgb> = None;
@@ -134,6 +271,28 @@ fn build_content(scene: &PlotScene) -> String {
                 let _ = writeln!(out, "f");
             }
             PlotItem::Glyphs(run) => {
+                // Shown as text when every face it needs was embedded;
+                // otherwise the outlines, which look identical and are what
+                // this always did.
+                let showable = !run.text.is_empty()
+                    && run.text.iter().all(|s| fonts.contains_key(s.face.as_ref()));
+                if showable {
+                    if current_fill != Some(run.style.color) {
+                        let _ = writeln!(
+                            out,
+                            "{} {} {} rg",
+                            fmt_channel(channel(run.style.color.r)),
+                            fmt_channel(channel(run.style.color.g)),
+                            fmt_channel(channel(run.style.color.b))
+                        );
+                        current_fill = Some(run.style.color);
+                    }
+                    for span in &run.text {
+                        let entry = &fonts[span.face.as_ref()];
+                        show_text(&mut out, span, entry);
+                    }
+                    continue;
+                }
                 if run.fill {
                     // TrueType contours are closed areas, so they are filled
                     // rather than stroked — outlining them would draw hollow
@@ -182,6 +341,43 @@ fn build_content(scene: &PlotScene) -> String {
     }
 
     out
+}
+
+/// Emit one laid-out line as a show-text operator.
+///
+/// The font is selected at size 1 and the whole scale lives in `Tm`, which
+/// is what lets one matrix carry the text height, the rotation, the oblique
+/// shear and AutoCAD's width factor together — the same composition the
+/// outline path applies to its points, so the two cannot drift apart.
+fn show_text(out: &mut String, span: &crate::text::layout::TextSpan, entry: &FontEntry) {
+    let mut hex = String::with_capacity(span.text.len() * 4);
+    for ch in span.text.chars() {
+        // A character with no glyph in the subset would show as .notdef and
+        // advance by the wrong width. The subset is built from these very
+        // characters, so this is a corruption guard.
+        let Some(gid) = entry.face.glyphs.get(&ch) else { return };
+        let _ = write!(hex, "{gid:04X}");
+    }
+    if hex.is_empty() {
+        return;
+    }
+    // Em space is millimetres here; the page is in points.
+    let t = span.transform;
+    let k = MM_TO_PT;
+    let _ = writeln!(out, "BT");
+    let _ = writeln!(out, "/{} 1 Tf", entry.resource);
+    let _ = writeln!(
+        out,
+        "{:.6} {:.6} {:.6} {:.6} {:.4} {:.4} Tm",
+        t.a * k,
+        t.b * k,
+        t.c * k,
+        t.d * k,
+        t.e * k,
+        t.f * k
+    );
+    let _ = writeln!(out, "<{hex}> Tj");
+    let _ = writeln!(out, "ET");
 }
 
 fn apply_stroke(
@@ -417,7 +613,7 @@ mod tests {
             });
         }
 
-        let raw = build_content(&s);
+        let raw = build_content(&s, &BTreeMap::new());
         let compressed = deflate(raw.as_bytes());
         assert!(
             compressed.len() * 4 < raw.len(),
@@ -442,6 +638,7 @@ mod tests {
             },
             style: StrokeStyle { color: Rgb::new(0, 0, 255), width_mm: 0.35, dash_mm: None },
             fill,
+            text: Vec::new(),
         }));
         s
     }
@@ -470,6 +667,112 @@ mod tests {
         assert!(text.contains("q 1 J 1 j"), "text was drawn with the page's butt caps: {text}");
         let geometry = decompressed_content(&write_pdf(&[line_scene(0.35)]));
         assert!(!geometry.contains("1 J"), "geometry must keep butt caps: {geometry}");
+    }
+
+    /// A scene holding one TrueType run: the outlines it would draw plus
+    /// the span describing the same glyphs as text.
+    fn ttf_text_scene() -> Option<PlotScene> {
+        let path = std::path::Path::new("C:\\Windows\\Fonts").join("arial.ttf");
+        if !path.is_file() {
+            eprintln!("SKIPPED: arial.ttf not present");
+            return None;
+        }
+        let bytes = std::fs::read(&path).ok()?;
+        let mut font = crate::text::ttf::TtfFont::load(bytes, 0).ok()?.from(path.clone());
+        let mut pair = crate::text::layout::FontPair {
+            primary: crate::text::layout::FontHandle::Ttf(Box::new(std::mem::replace(
+                &mut font,
+                crate::text::ttf::TtfFont::load(std::fs::read(&path).ok()?, 0).ok()?,
+            ))),
+            bigfont: crate::text::layout::FontHandle::None,
+        };
+        let entity = crate::dxf::entities::RawEntity {
+            kind: "TEXT".to_owned(),
+            codes: vec![
+                (1, crate::dxf::lexer::Value::Str(b"Plan".to_vec())),
+                (40, crate::dxf::lexer::Value::F64(10.0)),
+                (10, crate::dxf::lexer::Value::F64(20.0)),
+                (20, crate::dxf::lexer::Value::F64(20.0)),
+            ],
+        };
+        let laid = crate::text::layout::lay_out(
+            &entity,
+            &crate::dxf::tables::StyleRecord::default(),
+            &mut pair,
+            crate::encoding::Codepage::Gbk,
+        )?;
+        assert!(!laid.spans.is_empty(), "the layout produced no text span");
+        let mut scene = PlotScene::new(PaperSize::a4_landscape());
+        scene.items.push(PlotItem::Glyphs(crate::plot::GlyphRun {
+            geom: PathGeom {
+                subpaths: laid
+                    .filled
+                    .iter()
+                    .map(|points| SubPath { points: points.clone(), closed: true })
+                    .collect(),
+            },
+            style: StrokeStyle { color: Rgb::BLACK, width_mm: 0.35, dash_mm: None },
+            fill: true,
+            text: laid.spans,
+        }));
+        Some(scene)
+    }
+
+    /// R-TXT-4.2: a TrueType run must reach the page as text, with the face
+    /// embedded — matching the reference PDF, which embeds six TrueType
+    /// subsets (PRD 3.9.5).
+    #[test]
+    fn a_truetype_run_is_written_as_embedded_text() {
+        let Some(scene) = ttf_text_scene() else { return };
+        let out = write_pdf(&[scene]);
+        let raw = content(&out);
+        assert!(raw.contains("/Type0"), "no composite font was written");
+        assert!(raw.contains("/Identity-H"), "no Identity-H encoding");
+        assert!(raw.contains("/FontFile2"), "the face was not embedded");
+        let text = decompressed_content(&out);
+        assert!(text.contains(" Tj"), "no show-text operator: {text}");
+        assert!(text.contains("BT") && text.contains("ET"), "no text object");
+    }
+
+    /// The embedded subset must decode back to the original characters. A
+    /// PDF whose text extracts as the wrong characters is worse than one
+    /// that does not extract at all.
+    #[test]
+    fn the_embedded_subset_round_trips_through_to_unicode() {
+        let Some(scene) = ttf_text_scene() else { return };
+        let out = write_pdf(&[scene]);
+        assert!(content(&out).contains("/ToUnicode"), "no ToUnicode CMap was written");
+    }
+
+    /// Showing the text *and* filling the outlines would double-ink every
+    /// glyph — visible as a bolder, subtly misregistered page.
+    #[test]
+    fn a_shown_run_does_not_also_fill_its_outlines() {
+        let Some(scene) = ttf_text_scene() else { return };
+        let text = decompressed_content(&write_pdf(&[scene]));
+        assert!(text.contains(" Tj"), "the run was not shown as text at all");
+        assert!(
+            !text.lines().any(|l| l.trim() == "f"),
+            "the outlines were filled as well as shown: {text}"
+        );
+    }
+
+    /// A run whose face could not be embedded must still put ink on the
+    /// page. Text that silently disappears because a font failed to subset
+    /// is the one outcome worse than text that cannot be selected.
+    #[test]
+    fn a_run_whose_face_is_unavailable_falls_back_to_its_outlines() {
+        let Some(mut scene) = ttf_text_scene() else { return };
+        let PlotItem::Glyphs(run) = &mut scene.items[0] else { panic!("expected a glyph run") };
+        for span in &mut run.text {
+            span.face = std::sync::Arc::new(crate::text::ttf::FaceKey {
+                path: std::path::PathBuf::from("C:\\nope\\missing.ttf"),
+                index: 0,
+            });
+        }
+        let text = decompressed_content(&write_pdf(&[scene]));
+        assert!(!text.contains(" Tj"), "a missing face was shown as text anyway");
+        assert!(text.lines().any(|l| l.trim() == "f"), "the fallback drew nothing: {text}");
     }
 
     /// The colour, width and dash a run sets must be emitted *before* its

@@ -369,6 +369,7 @@ mod tests {
             },
             style: StrokeStyle { color: Rgb::BLACK, width_mm: 0.5, dash_mm: None },
             fill,
+            text: Vec::new(),
         }));
         s
     }

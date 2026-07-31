@@ -28,6 +28,10 @@ pub struct CharGeom {
     pub advance: f64,
     /// SHX glyphs are pen strokes; TrueType glyphs are closed contours.
     pub fill: bool,
+    /// The TrueType face this glyph came from, when it came from one and
+    /// that face's file is known. Carried so the PDF writer can embed the
+    /// face and write the run as text rather than as outlines (R-TXT-4.2).
+    pub face: Option<std::sync::Arc<crate::text::ttf::FaceKey>>,
 }
 
 fn scale_contours(source: &[Vec<Point>], factor: f64) -> Vec<Vec<Point>> {
@@ -49,11 +53,13 @@ impl FontHandle {
             FontHandle::None => None,
             FontHandle::Ttf(font) => {
                 let em = font.em();
+                let face = font.source();
                 let glyph = font.glyph(ch)?;
                 Some(CharGeom {
                     contours: scale_contours(&glyph.contours, 1.0 / em),
                     advance: glyph.advance / em,
                     fill: true,
+                    face,
                 })
             }
             FontHandle::Shx(font) => {
@@ -71,6 +77,7 @@ impl FontHandle {
                     contours: scale_contours(&outline.strokes, 1.0 / em),
                     advance: outline.advance / em,
                     fill: false,
+                    face: None,
                 })
             }
         }
@@ -120,12 +127,39 @@ const MAX_CHARS: usize = 100_000;
 /// default MTEXT spacing factor.
 const LINE_SPACING: f64 = 1.667;
 
+/// One line of text as the PDF writer needs it: the characters, the face
+/// they were all drawn from, and the transform that takes em space — x in
+/// advance units along the baseline, y up — into drawing units.
+///
+/// This is a description of the *same* glyphs the outlines describe, not a
+/// second layout. A backend either draws the outlines or shows the text;
+/// doing both would double-ink the page.
+#[derive(Clone, Debug)]
+pub struct TextSpan {
+    pub face: std::sync::Arc<crate::text::ttf::FaceKey>,
+    pub text: String,
+    /// Em space to drawing units. Deliberately non-uniform: AutoCAD's width
+    /// factor stretches the glyph shapes themselves, exactly as this
+    /// transform's x scale does, so the shown text matches the outlines it
+    /// replaces without a separate horizontal-scaling operator to keep in
+    /// step.
+    pub transform: Affine,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct TextGeom {
     /// Pen strokes in drawing units, already rotated and positioned.
     pub stroked: Vec<Vec<Point>>,
     /// Closed contours to fill, in the same coordinate system.
     pub filled: Vec<Vec<Point>>,
+    /// The same glyphs as `filled`, described as text.
+    ///
+    /// Populated only when the whole entity is one TrueType face and every
+    /// character in it was drawn — a run that mixes an SHX primary with a
+    /// TrueType big font, or that silently dropped a character the face
+    /// lacks, cannot be replaced by a show-text operator without changing
+    /// what is on the page. Empty means "draw the outlines".
+    pub spans: Vec<TextSpan>,
 }
 
 /// One laid-out line: outlines in em units with the origin at the line's
@@ -135,6 +169,15 @@ struct Line {
     stroked: Vec<Vec<Point>>,
     filled: Vec<Vec<Point>>,
     width: f64,
+    /// The characters drawn, when every one of them came from the same
+    /// TrueType face. `None` the moment anything else happens.
+    text: Option<String>,
+    face: Option<std::sync::Arc<crate::text::ttf::FaceKey>>,
+    /// The width factor this line was run at, which for MTEXT includes the
+    /// span's own multiplier.
+    width_factor: f64,
+    /// The height multiplier this line was run at.
+    height_factor: f64,
 }
 
 /// Place one string's glyphs along a baseline starting at x = 0.
@@ -155,15 +198,30 @@ fn run_line(
     width_factor: f64,
     height_factor: f64,
 ) -> Line {
-    let mut line = Line::default();
+    let mut line = Line { width_factor, height_factor, text: Some(String::new()), ..Line::default() };
     let mut x = 0.0f64;
     for ch in text.chars().take(MAX_CHARS) {
         let Some(glyph) = fonts.char_geom(ch, cp) else {
             // A character no font can draw advances by a blank so the rest
-            // of the line does not shift left.
+            // of the line does not shift left. It cannot be shown as text
+            // either: the PDF would advance by the face's own width for a
+            // glyph we drew as a gap.
+            line.text = None;
             x += 0.5 * width_factor;
             continue;
         };
+        match (&glyph.face, &line.face) {
+            // First glyph: adopt its face.
+            (Some(face), None) => line.face = Some(face.clone()),
+            // Same face as everything before it.
+            (Some(face), Some(seen)) if face == seen => {}
+            // An SHX glyph, or a second face. Either way the line is no
+            // longer one embeddable run.
+            _ => line.text = None,
+        }
+        if let Some(collected) = &mut line.text {
+            collected.push(ch);
+        }
         for contour in &glyph.contours {
             let placed: Vec<Point> = contour
                 .iter()
@@ -392,6 +450,11 @@ pub fn lay_out(
         .then(Affine::translation(origin.x, origin.y));
 
     let mut out = TextGeom::default();
+    // Every line must be embeddable, or none is: the spans replace the
+    // filled outlines wholesale, and a partial replacement would drop
+    // whichever lines could not be shown as text.
+    let mut spans = Vec::with_capacity(lines.len());
+    let mut all_lines_embeddable = true;
     for (index, line) in lines.iter().enumerate() {
         let baseline = Affine::translation(0.0, -(index as f64) * LINE_SPACING).then(transform);
         for contour in &line.stroked {
@@ -400,6 +463,36 @@ pub fn lay_out(
         for contour in &line.filled {
             out.filled.push(contour.iter().map(|p| baseline.apply(*p)).collect());
         }
+        match (&line.text, &line.face) {
+            (Some(text), Some(face)) if !text.is_empty() => {
+                let placement = Affine::scale(
+                    line.width_factor * line.height_factor,
+                    line.height_factor,
+                )
+                .then(baseline);
+                if [placement.a, placement.b, placement.c, placement.d, placement.e, placement.f]
+                    .iter()
+                    .all(|v| v.is_finite())
+                {
+                    spans.push(TextSpan {
+                        face: face.clone(),
+                        text: text.clone(),
+                        transform: placement,
+                    });
+                } else {
+                    all_lines_embeddable = false;
+                }
+            }
+            // A line that drew nothing needs no span; anything else that
+            // did draw and has no span is a line the text path cannot
+            // reproduce.
+            _ => all_lines_embeddable &= line.filled.is_empty(),
+        }
+    }
+    // An entity with pen strokes in it is a mixed run whose filled half
+    // cannot be swapped out on its own.
+    if out.stroked.is_empty() && all_lines_embeddable {
+        out.spans = spans;
     }
 
     // A non-finite parameter that slipped through must not reach the

@@ -20,11 +20,26 @@ pub struct TtfGlyph {
     pub advance: f64,
 }
 
+/// Which face on disk a run's glyphs came from.
+///
+/// The PDF writer embeds a subset per face and needs to group runs by the
+/// face they used, so the identity has to survive layout. A `.ttc` holds
+/// several faces, which is why the index is part of it.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct FaceKey {
+    pub path: std::path::PathBuf,
+    pub index: u32,
+}
+
 pub struct TtfFont {
     /// Owned so the `Face` borrowed from it can be rebuilt per lookup
     /// without the caller having to keep the bytes alive.
     data: Vec<u8>,
     face_index: u32,
+    /// Where the bytes came from. `None` for a font handed over directly,
+    /// which the PDF writer then cannot embed — it re-reads the file rather
+    /// than carrying a second copy of every loaded face.
+    source: Option<Arc<FaceKey>>,
     em: f64,
     /// `Arc` rather than `Rc` for the same reason as `ShxFont`'s cache: the
     /// viewer moves the whole text engine into its rebuild thread.
@@ -109,7 +124,19 @@ impl TtfFont {
         if em <= 0.0 {
             return Err("TrueType 字库的 unitsPerEm 无效".to_owned());
         }
-        Ok(TtfFont { data, face_index, em, cache: HashMap::new() })
+        Ok(TtfFont { data, face_index, source: None, em, cache: HashMap::new() })
+    }
+
+    /// Record where this face was read from, so a run drawn with it can be
+    /// embedded in the PDF rather than only outlined.
+    pub fn from(mut self, path: std::path::PathBuf) -> Self {
+        let index = self.face_index;
+        self.source = Some(Arc::new(FaceKey { path, index }));
+        self
+    }
+
+    pub fn source(&self) -> Option<Arc<FaceKey>> {
+        self.source.clone()
     }
 
     pub fn em(&self) -> f64 {

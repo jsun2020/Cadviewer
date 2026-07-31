@@ -54,7 +54,9 @@ fn open(resolved: &Resolved) -> Result<FontHandle, String> {
         Resolved::Ttf(path, index) => {
             let bytes = std::fs::read(path).map_err(|e| format!("{}：{e}", path.display()))?;
             ttf::TtfFont::load(bytes, *index)
-                .map(|f| FontHandle::Ttf(Box::new(f)))
+                // The path travels with the face so the PDF writer can
+                // re-read and subset it (R-TXT-4.2).
+                .map(|f| FontHandle::Ttf(Box::new(f.from(path.clone()))))
                 .map_err(|e| format!("{}：{e}", path.display()))
         }
     }
@@ -151,27 +153,32 @@ impl TextEngine {
         self.pairs.get_mut(&key).expect("just inserted")
     }
 
-    /// Lay one entity out, or `None` if it is not a text entity.
-    /// Whether an entity's text contains a character only a big font can
-    /// draw, in this drawing's codepage.
+    /// Whether this entity holds a double-byte character the style's fonts
+    /// cannot draw between them.
     ///
-    /// The test is "does it encode to two bytes", not "is it ASCII": in a
-    /// GBK drawing the degree sign is single-byte and lives in the primary,
-    /// while every Han character needs the big font. Both group 1 and the
-    /// group 3 continuation fragments an MTEXT splits its text across are
-    /// scanned, or a long paragraph whose Chinese begins after the first
-    /// 250 bytes would look Latin-only.
-    fn needs_bigfont(entity: &RawEntity, cp: Codepage) -> bool {
-        entity
-            .codes
-            .iter()
-            .filter(|(code, _)| *code == 1 || *code == 3)
-            .filter_map(|(_, value)| value.as_bytes())
-            .any(|bytes| {
-                crate::encoding::decode(bytes, cp)
-                    .chars()
-                    .any(|ch| crate::encoding::bigfont_code(ch, cp).is_some())
-            })
+    /// Asking the pair, rather than assuming, is what keeps the fallback
+    /// off a style whose primary is a CJK TrueType face: `char_geom` already
+    /// falls back from the big font to the primary, so SimHei draws its own
+    /// Chinese and stays embeddable. The test for "double byte" is the
+    /// codepage encoding, not "is it ASCII" — in a GBK drawing the degree
+    /// sign is single-byte and belongs to the primary. Group 3 fragments are
+    /// scanned alongside group 1, or a long MTEXT whose Chinese starts after
+    /// the first 250 bytes would look Latin-only.
+    fn undrawable_double_byte(entity: &RawEntity, cp: Codepage, fonts: &mut FontPair) -> bool {
+        for (code, value) in &entity.codes {
+            if !matches!(code, 1 | 3) {
+                continue;
+            }
+            let Some(bytes) = value.as_bytes() else { continue };
+            for ch in crate::encoding::decode(bytes, cp).chars() {
+                if crate::encoding::bigfont_code(ch, cp).is_some()
+                    && fonts.char_geom(ch, cp).is_none()
+                {
+                    return true;
+                }
+            }
+        }
+        false
     }
 
     /// Give a style that names no big font one, once, when its text turns
@@ -198,6 +205,7 @@ impl TextEngine {
         }
     }
 
+    /// Lay one entity out, or `None` if it is not a text entity.
     pub fn lay_out(&mut self, entity: &RawEntity) -> Option<TextGeom> {
         if !matches!(entity.kind.as_str(), "TEXT" | "MTEXT" | "ATTRIB") {
             return None;
@@ -208,9 +216,11 @@ impl TextEngine {
         // Only when the style names no big font at all. One that names a
         // missing font has already been through the substitution chain and
         // reported; running it again would say the same thing twice.
+        let pair = self.pair_for(&style);
         let unnamed_bigfont = style.bigfont.trim().is_empty()
-            && matches!(self.pair_for(&style).bigfont, FontHandle::None);
-        if unnamed_bigfont && Self::needs_bigfont(entity, codepage) {
+            && matches!(pair.bigfont, FontHandle::None)
+            && Self::undrawable_double_byte(entity, codepage, pair);
+        if unnamed_bigfont {
             let name = if style.name.is_empty() { "(未命名)" } else { style.name.as_str() };
             let name = name.to_owned();
             self.ensure_cjk_fallback(&key, &name);

@@ -52,6 +52,14 @@ pub struct GlyphRun {
     /// SHX is a stroke font, so its outlines are stroked at the entity's
     /// lineweight. TrueType contours are closed and must be filled.
     pub fill: bool,
+    /// The same glyphs described as text, in paper millimetres, when they
+    /// all came from one embeddable TrueType face.
+    ///
+    /// A backend either draws `geom` or shows these, never both. The screen
+    /// has no use for them — it draws the outlines — but the PDF can embed
+    /// the face and emit a show-text operator, which is what makes the page
+    /// selectable and searchable (R-TXT-4.2).
+    pub text: Vec<crate::text::layout::TextSpan>,
 }
 
 #[derive(Clone, Debug)]

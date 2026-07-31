@@ -9,7 +9,14 @@
 
 ## Rust dependencies
 
-The GUI and rendering pipeline use eframe/egui, resvg, svg2pdf, rfd and
-tempfile. Their transitive license metadata is recorded by Cargo in
-`Cargo.lock`; release packaging retains this notice and the project source.
+The GUI and rendering pipeline use eframe/egui, tiny-skia, pdf-writer,
+ttf-parser, subsetter, flate2, encoding_rs, rfd and tempfile. Their
+transitive license metadata is recorded by Cargo in `Cargo.lock`; release
+packaging retains this notice and the project source.
+
+No font is bundled. SHX stroke fonts are Autodesk/third-party licensed
+assets and TrueType faces belong to their vendors; every font this program
+uses is located on the user's own machine at runtime. Subsets of a user's
+TrueType faces are embedded in the PDFs that user exports, which is the
+ordinary embedding any CAD or office application performs on their behalf.
 

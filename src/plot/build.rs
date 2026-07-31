@@ -258,6 +258,16 @@ fn emit(
         // R-TXT-4.4: the stroke width is whatever R-LW resolved for this
         // entity. Text does not get a width of its own.
         let width_mm = resolve_width_mm(ent, layer, inherited.lineweight, doc.header.celweight);
+        // The spans describe the filled outlines, so they ride with that
+        // half of the run and never with the stroked half.
+        let spans: Vec<crate::text::layout::TextSpan> = laid
+            .spans
+            .into_iter()
+            .map(|span| crate::text::layout::TextSpan {
+                transform: span.transform.then(transform),
+                ..span
+            })
+            .collect();
         for (contours, fill) in [(laid.stroked, false), (laid.filled, true)] {
             if contours.is_empty() {
                 continue;
@@ -286,6 +296,7 @@ fn emit(
                 geom,
                 style: StrokeStyle { color, width_mm, dash_mm: None },
                 fill,
+                text: if fill { spans.clone() } else { Vec::new() },
             }));
         }
         return;
