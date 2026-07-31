@@ -8,3 +8,4 @@ pub mod plot;
 pub mod render;
 pub mod sheets;
 pub mod shx;
+pub mod text;
