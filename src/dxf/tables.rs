@@ -57,6 +57,46 @@ pub struct LtypeRecord {
     pub pattern: Vec<f64>,
 }
 
+/// One TEXTSTYLE record.
+///
+/// Font names are kept exactly as written. The reference drawing spells
+/// them five different ways — `isocp.shx`, `SIMPLEX`, `txt`, `simhei.ttf`
+/// and empty — and normalising here would lose the distinction between
+/// "no font named" and "a font whose name is missing an extension".
+/// Normalisation belongs to the file search (`text::search`).
+#[derive(Clone, Debug)]
+pub struct StyleRecord {
+    pub name: String,
+    /// Group 3.
+    pub primary: String,
+    /// Group 4. Empty for Latin-only styles.
+    pub bigfont: String,
+    /// Group 40. Non-zero overrides the entity's own height (group 40 on
+    /// TEXT); measured values in the reference drawing include 2.5, 3.0,
+    /// 3.5, 200.0 and 250.0.
+    pub fixed_height: f64,
+    /// Group 41. Measured: 0.667, 0.7, 0.707, 0.75, 0.8, 0.9, 1.0.
+    pub width_factor: f64,
+    /// Group 50, degrees.
+    pub oblique: f64,
+    /// Group 71: bit 2 backward, bit 4 upside down.
+    pub generation: i32,
+}
+
+impl Default for StyleRecord {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            primary: String::new(),
+            bigfont: String::new(),
+            fixed_height: 0.0,
+            width_factor: 1.0,
+            oblique: 0.0,
+            generation: 0,
+        }
+    }
+}
+
 /// Read `$`-prefixed header variables. Layout is `9 <name>` followed by one
 /// or more value pairs belonging to that name.
 pub fn read_header(pairs: &[Pair]) -> HeaderVars {
@@ -153,6 +193,10 @@ fn record_i32(rec: &[&Pair], code: i32) -> Option<i32> {
     rec.iter().find(|p| p.code == code).and_then(|p| p.value.as_i32())
 }
 
+fn record_f64(rec: &[&Pair], code: i32) -> Option<f64> {
+    rec.iter().find(|p| p.code == code).and_then(|p| p.value.as_f64())
+}
+
 pub fn read_layers(pairs: &[Pair], cp: Codepage) -> HashMap<String, LayerRecord> {
     let mut out = HashMap::new();
     for rec in table_records(pairs, "LAYER") {
@@ -191,6 +235,32 @@ pub fn read_ltypes(pairs: &[Pair], cp: Codepage) -> HashMap<String, LtypeRecord>
     out
 }
 
+/// Read the STYLE table, keyed upper-case.
+///
+/// Style names are case-insensitive in AutoCAD, and every ATTRIB in the
+/// reference drawing omits group 7 entirely, so it must find `Standard`
+/// however the table spells it.
+pub fn read_styles(pairs: &[Pair], cp: Codepage) -> HashMap<String, StyleRecord> {
+    let mut out = HashMap::new();
+    for rec in table_records(pairs, "STYLE") {
+        let Some(name) = record_string(&rec, 2, cp) else { continue };
+        let width = record_f64(&rec, 41).unwrap_or(1.0);
+        let record = StyleRecord {
+            primary: record_string(&rec, 3, cp).unwrap_or_default(),
+            bigfont: record_string(&rec, 4, cp).unwrap_or_default(),
+            fixed_height: record_f64(&rec, 40).unwrap_or(0.0),
+            // A zero or negative width factor would collapse every glyph
+            // to a vertical line; AutoCAD treats it as 1.
+            width_factor: if width > 0.0 { width } else { 1.0 },
+            oblique: record_f64(&rec, 50).unwrap_or(0.0),
+            generation: record_i32(&rec, 71).unwrap_or(0),
+            name: name.clone(),
+        };
+        out.insert(name.to_ascii_uppercase(), record);
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -221,5 +291,48 @@ mod tests {
     fn reads_linetype_dash_patterns() {
         let ltypes = read_ltypes(&lex(SRC).unwrap(), Codepage::Gbk);
         assert_eq!(ltypes["HIDDEN"].pattern, vec![6.35, -3.175]);
+    }
+
+    /// The five shapes a font reference takes in the reference drawing:
+    /// a full filename, an extension-less upper-case name, an empty
+    /// bigfont, a `.ttf`, and no font at all.
+    const STYLE_SRC: &[u8] = b"  0\nSECTION\n  2\nTABLES\n  0\nTABLE\n  2\nSTYLE\n  0\nSTYLE\n  2\nStandard\n  3\nisocp.shx\n  4\nhztxt.shx\n 40\n0.0\n 41\n0.707\n 50\n0.0\n 71\n0\n  0\nSTYLE\n  2\nDIM_FONT\n  3\nSIMPLEX\n  4\nGBCBIG\n 40\n3.5\n 41\n0.7\n 50\n15.0\n 71\n2\n  0\nSTYLE\n  2\nTKHT\n  3\nsimhei.ttf\n 40\n0.0\n 41\n0.75\n  0\nSTYLE\n  2\nBARE\n 41\n1.0\n  0\nENDTAB\n  0\nENDSEC\n  0\nEOF\n";
+
+    #[test]
+    fn reads_style_font_references_in_every_shape_they_take() {
+        let styles = read_styles(&lex(STYLE_SRC).unwrap(), Codepage::Gbk);
+        assert_eq!(styles.len(), 4);
+        let standard = &styles["STANDARD"];
+        assert_eq!(standard.primary, "isocp.shx");
+        assert_eq!(standard.bigfont, "hztxt.shx");
+        assert!((standard.width_factor - 0.707).abs() < 1e-9);
+        let dim = &styles["DIM_FONT"];
+        assert_eq!(dim.primary, "SIMPLEX", "the name must not be normalised here");
+        assert_eq!(dim.fixed_height, 3.5);
+        assert_eq!(dim.oblique, 15.0);
+        assert_eq!(dim.generation, 2);
+        assert_eq!(styles["TKHT"].primary, "simhei.ttf");
+        assert_eq!(styles["TKHT"].bigfont, "");
+        assert_eq!(styles["BARE"].primary, "");
+    }
+
+    /// A style with no group 41 must not scale text to nothing. AutoCAD's
+    /// default width factor is 1.
+    #[test]
+    fn a_missing_width_factor_defaults_to_one() {
+        let src = b"  0\nSECTION\n  2\nTABLES\n  0\nTABLE\n  2\nSTYLE\n  0\nSTYLE\n  2\nS\n  3\ntxt\n  0\nENDTAB\n  0\nENDSEC\n  0\nEOF\n";
+        let styles = read_styles(&lex(src).unwrap(), Codepage::Gbk);
+        assert_eq!(styles["S"].width_factor, 1.0);
+        assert_eq!(styles["S"].fixed_height, 0.0);
+    }
+
+    /// Style names are case-insensitive in AutoCAD, and 504 ATTRIBs in the
+    /// reference drawing carry no group 7 at all — they resolve through
+    /// the name `Standard`, which must be found however it is spelled.
+    #[test]
+    fn styles_are_keyed_case_insensitively() {
+        let styles = read_styles(&lex(STYLE_SRC).unwrap(), Codepage::Gbk);
+        assert!(styles.contains_key("STANDARD"));
+        assert!(!styles.contains_key("Standard"), "keys must be upper-cased");
     }
 }

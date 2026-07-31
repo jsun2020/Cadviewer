@@ -3,7 +3,8 @@ use std::collections::HashMap;
 use crate::dxf::entities::{BlockRecord, RawEntity, read_blocks, read_section};
 use crate::dxf::lexer::lex;
 use crate::dxf::tables::{
-    HeaderVars, LayerRecord, LtypeRecord, read_header, read_layers, read_ltypes,
+    HeaderVars, LayerRecord, LtypeRecord, StyleRecord, read_header, read_layers, read_ltypes,
+    read_styles,
 };
 
 #[derive(Debug)]
@@ -11,6 +12,8 @@ pub struct Document {
     pub header: HeaderVars,
     pub layers: HashMap<String, LayerRecord>,
     pub ltypes: HashMap<String, LtypeRecord>,
+    /// TEXTSTYLE records, keyed upper-case.
+    pub styles: HashMap<String, StyleRecord>,
     pub blocks: HashMap<String, BlockRecord>,
     /// Model-space and paper-space entities from the ENTITIES section only.
     /// Block bodies live in `blocks` and are reached through INSERT.
@@ -25,6 +28,7 @@ impl Document {
         Ok(Document {
             layers: read_layers(&pairs, cp),
             ltypes: read_ltypes(&pairs, cp),
+            styles: read_styles(&pairs, cp),
             blocks: read_blocks(&pairs, cp),
             entities: read_section(&pairs, "ENTITIES"),
             header,
@@ -33,6 +37,21 @@ impl Document {
 
     pub fn layer(&self, name: &str) -> Option<&LayerRecord> {
         self.layers.get(name)
+    }
+
+    /// Look a style up by the name an entity's group 7 carries.
+    ///
+    /// An absent or unknown name falls back to `Standard`, which is what
+    /// AutoCAD does and what all 504 ATTRIBs in the reference drawing —
+    /// none of which carry a group 7 — depend on.
+    pub fn style(&self, name: &str) -> Option<&StyleRecord> {
+        let key = name.trim();
+        if !key.is_empty()
+            && let Some(found) = self.styles.get(&key.to_ascii_uppercase())
+        {
+            return Some(found);
+        }
+        self.styles.get("STANDARD")
     }
 }
 
@@ -79,5 +98,14 @@ mod tests {
         // origin and once through its INSERT.
         let d = Document::parse(SRC).unwrap();
         assert_eq!(d.entities.iter().filter(|e| e.kind == "LINE").count(), 1);
+    }
+
+    #[test]
+    fn an_entity_without_a_style_name_falls_back_to_standard() {
+        let src = b"  0\nSECTION\n  2\nTABLES\n  0\nTABLE\n  2\nSTYLE\n  0\nSTYLE\n  2\nStandard\n  3\nisocp.shx\n  4\nhztxt.shx\n 41\n0.707\n  0\nENDTAB\n  0\nENDSEC\n  0\nEOF\n";
+        let d = Document::parse(src).unwrap();
+        assert_eq!(d.style("").unwrap().primary, "isocp.shx");
+        assert_eq!(d.style("NoSuchStyle").unwrap().primary, "isocp.shx");
+        assert_eq!(d.style("standard").unwrap().primary, "isocp.shx");
     }
 }
