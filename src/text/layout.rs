@@ -139,12 +139,15 @@ struct Line {
 
 /// Place one string's glyphs along a baseline starting at x = 0.
 ///
-/// `line.width` reports the rightmost ink actually drawn, not the summed
-/// advance cursor. SHX letters carry real trailing space after their own
-/// strokes (simplex 'M' advances 1.14 em but its ink stops at 0.76), so a
-/// right- or centre-justified run anchored on the advance total overshoots
-/// past the true glyph edge by exactly that trailing gap. Anchoring on the
-/// rendered extent instead lands the visible edge on the alignment point.
+/// `line.width` is the summed glyph advance — the pen's final x, not a
+/// bounding box of the ink. That is what an SHX glyph program actually
+/// encodes (a sequence of pen moves ending in a pen-up move to the next
+/// glyph's origin) and it is what AutoCAD justifies against: a stroke
+/// font carries real trailing side bearing after its own ink (simplex
+/// 'A' advances 1.048 em against 0.762 em of ink), so right- and
+/// centre-justified text visibly stops short of the alignment point by
+/// that gap — the small offset drafters see when snapping justified text
+/// to a grid line.
 fn run_line(
     text: &str,
     fonts: &mut FontPair,
@@ -154,7 +157,6 @@ fn run_line(
 ) -> Line {
     let mut line = Line::default();
     let mut x = 0.0f64;
-    let mut ink_max_x = 0.0f64;
     for ch in text.chars().take(MAX_CHARS) {
         let Some(glyph) = fonts.char_geom(ch, cp) else {
             // A character no font can draw advances by a blank so the rest
@@ -167,11 +169,6 @@ fn run_line(
                 .iter()
                 .map(|p| Point::new(x + p.x * width_factor * height_factor, p.y * height_factor))
                 .collect();
-            for p in &placed {
-                if p.x.is_finite() {
-                    ink_max_x = ink_max_x.max(p.x);
-                }
-            }
             if glyph.fill {
                 line.filled.push(placed);
             } else {
@@ -180,9 +177,7 @@ fn run_line(
         }
         x += glyph.advance * width_factor * height_factor;
     }
-    // A blank line (spaces only, or empty) has no ink to anchor on; fall
-    // back to the advance cursor so it still occupies its true space.
-    line.width = if ink_max_x > 0.0 { ink_max_x } else { x };
+    line.width = x;
     line
 }
 
@@ -222,7 +217,9 @@ pub fn lay_out(
         let chosen = if value.is_finite() { value } else { style.oblique };
         if chosen.is_finite() { chosen.clamp(-85.0, 85.0) } else { 0.0 }
     };
-    let rotation = {
+    // Mutable: group 72 = 5 "Fit" derives the rotation from the vector
+    // between the two points rather than from group 50.
+    let mut rotation = {
         let value = entity.f64(50, 0.0);
         if value.is_finite() { value } else { 0.0 }
     };
@@ -281,8 +278,9 @@ pub fn lay_out(
     let widest = lines.iter().map(|l| l.width).fold(0.0f64, f64::max);
     let line_count = lines.len() as f64;
 
-    // Justification, in em units relative to the run's own origin.
-    let (dx, dy) = if is_mtext {
+    // Justification, in em units relative to the run's own origin. `dx`
+    // is mutable: group 72 = 5 "Fit" below overrides it to zero.
+    let (mut dx, dy) = if is_mtext {
         // Group 71: 1..3 top row, 4..6 middle, 7..9 bottom;
         // 1/4/7 left, 2/5/8 centre, 3/6/9 right.
         let attach = entity.int(71, 1).clamp(1, 9);
@@ -319,18 +317,36 @@ pub fn lay_out(
         (-widest * column / 2.0, dy)
     };
 
-    // The origin every offset is measured from.
+    // The origin every offset is measured from. Mutable: group 72 = 5
+    // "Fit" below overrides it back to the insertion point even though
+    // it is otherwise an alignment-point case.
     let uses_alignment_point = if is_mtext {
         false
     } else {
         entity.int(72, 0) != 0 || entity.int(73, 0) != 0
     };
-    let origin = if uses_alignment_point {
+    let mut origin = if uses_alignment_point {
         let p = Point::new(entity.f64(11, insertion.x), entity.f64(21, insertion.y));
         if p.x.is_finite() && p.y.is_finite() { p } else { insertion }
     } else {
         insertion
     };
+
+    // 72 = 5 "Fit": the run is stretched or compressed to span exactly
+    // between its two points, at its natural height. Left unhandled it
+    // falls through to plain left alignment at natural width, which is
+    // 227 entities in the reference drawing rendered too wide.
+    if !is_mtext && entity.int(72, 0) == 5 {
+        let target = Point::new(entity.f64(11, insertion.x), entity.f64(21, insertion.y));
+        let span = ((target.x - insertion.x).powi(2) + (target.y - insertion.y).powi(2)).sqrt();
+        let natural = widest * height;
+        if span.is_finite() && span > 0.0 && natural.is_finite() && natural > 0.0 {
+            lines = vec![run_line(&raw, fonts, cp, width_factor * (span / natural), 1.0)];
+            rotation = (target.y - insertion.y).atan2(target.x - insertion.x).to_degrees();
+            origin = insertion;
+            dx = 0.0;
+        }
+    }
 
     // em units -> drawing units -> oblique -> rotation -> position. The
     // shear is applied before the rotation so a slanted, rotated run
@@ -343,11 +359,14 @@ pub fn lay_out(
         e: 0.0,
         f: 0.0,
     };
-    // Group 71 generation flags: bit 2 backward, bit 4 upside down.
-    let generation = entity.int(71, style.generation);
+    // Group 71 generation flags: bit 2 backward, bit 4 upside down. Read
+    // only here, for TEXT/ATTRIB — on MTEXT group 71 is the attachment
+    // point, an unrelated field, and must never be read as generation
+    // flags even though the current MTEXT path never uses the result.
     let mirror = if is_mtext {
         Affine::identity()
     } else {
+        let generation = entity.int(71, style.generation);
         Affine::scale(
             if generation & 2 != 0 { -1.0 } else { 1.0 },
             if generation & 4 != 0 { -1.0 } else { 1.0 },
@@ -628,8 +647,53 @@ mod tests {
         assert!(left.min_x.abs() < 1.0, "left run started at {}", left.min_x);
         // Centred text straddles x = 1000.
         assert!(centre.min_x < 1000.0 && centre.max_x > 1000.0, "{centre:?}");
-        // Right-aligned text ends there.
-        assert!((right.max_x - 1000.0).abs() < 2.0, "{right:?}");
+        // Right justification anchors the run's ADVANCE end on the
+        // alignment point, not its last glyph's ink. SHX stroke fonts
+        // carry a real trailing side bearing (simplex 'A': advance
+        // 1.048 em against 0.762 em of ink), so the visible edge stops
+        // short of the point by that gap — the small offset drafters see
+        // when they snap right-justified text to a grid line.
+        assert!(right.max_x <= 1000.0, "ink crossed the alignment point: {right:?}");
+        assert!(right.max_x > 960.0, "ink stops too far short of it: {right:?}");
+    }
+
+    /// R-TXT-3.2, group 72 = 5 "Fit": the run spans exactly between its
+    /// two points at its natural height. Measured: 227 entities in the
+    /// reference drawing use this, all with real spans.
+    #[test]
+    fn fitted_text_is_compressed_to_span_its_two_points() {
+        let Some(mut fonts) = simplex_pair() else { return };
+        let codes = [
+            (40, Value::F64(286.0)),
+            (10, Value::F64(0.0)), (20, Value::F64(0.0)),
+            (11, Value::F64(200.0)), (21, Value::F64(0.0)),
+        ];
+        let mut fitted = codes.to_vec();
+        fitted.push((72, Value::I32(5)));
+        let fit = bounds(&lay_out(&text_entity("ABCDEF", &fitted), &StyleRecord::default(), &mut fonts, Codepage::Gbk).unwrap());
+        let natural = bounds(&lay_out(&text_entity("ABCDEF", &codes), &StyleRecord::default(), &mut fonts, Codepage::Gbk).unwrap());
+        assert!(natural.width() > 600.0, "control: natural width should far exceed the span, got {natural:?}");
+        assert!(fit.max_x <= 205.0, "fitted text overflows its span: {fit:?}");
+        assert!(fit.max_x > 120.0, "fitted text is far short of its span: {fit:?}");
+        assert!((fit.height() - natural.height()).abs() < 5.0, "fit must preserve the height");
+    }
+
+    /// A degenerate span must not divide by zero or explode.
+    #[test]
+    fn fitted_text_with_a_zero_span_degrades_instead_of_dividing_by_zero() {
+        let Some(mut fonts) = simplex_pair() else { return };
+        let ent = text_entity("AB", &[
+            (40, Value::F64(100.0)),
+            (10, Value::F64(50.0)), (20, Value::F64(50.0)),
+            (11, Value::F64(50.0)), (21, Value::F64(50.0)),
+            (72, Value::I32(5)),
+        ]);
+        let g = lay_out(&ent, &StyleRecord::default(), &mut fonts, Codepage::Gbk).unwrap();
+        for c in g.stroked.iter().chain(g.filled.iter()) {
+            for p in c {
+                assert!(p.x.is_finite() && p.y.is_finite(), "non-finite point {p:?}");
+            }
+        }
     }
 
     /// R-TXT-3.2: vertical justification 3 is "top", so the text hangs

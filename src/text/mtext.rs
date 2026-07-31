@@ -132,6 +132,7 @@ pub fn parse(raw: &str) -> Vec<Span> {
                         // the multiplier at 1 rather than scaling by it.
                         if let Some(value) = arg.strip_suffix(['x', 'X'])
                             && let Ok(parsed) = value.parse::<f64>()
+                            && parsed.is_finite()
                             && parsed > 0.0
                         {
                             state.height = parsed;
@@ -141,6 +142,7 @@ pub fn parse(raw: &str) -> Vec<Span> {
                     'W' => {
                         let arg = take_until_semicolon(&chars, &mut i);
                         if let Ok(parsed) = arg.trim_end_matches(['x', 'X']).parse::<f64>()
+                            && parsed.is_finite()
                             && parsed > 0.0
                         {
                             state.width = parsed;
