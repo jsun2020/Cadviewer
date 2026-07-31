@@ -10,7 +10,11 @@ fn fonts_dir() -> Option<PathBuf> {
 }
 
 fn load(name: &str) -> Option<Vec<u8>> {
-    let path = fonts_dir()?.join(name);
+    let Some(dir) = fonts_dir() else {
+        eprintln!("SKIPPED: AutoCAD fonts dir not present");
+        return None;
+    };
+    let path = dir.join(name);
     if !path.is_file() {
         eprintln!("SKIPPED: {} not present", path.display());
         return None;
