@@ -281,7 +281,26 @@ pub fn lay_out(
     } else {
         return Some(TextGeom::default());
     };
-    let width_factor = positive_or(entity, 41, style.width_factor, 1.0);
+    // Group 41 does not mean the same thing on both entities. On TEXT and
+    // ATTRIB it is the relative X scale — the width factor. On MTEXT it is
+    // the *reference rectangle width*, in drawing units, which is the
+    // column width the paragraph wraps at; MTEXT has no per-entity width
+    // factor at all and takes the style's.
+    //
+    // Measured across the reference drawing, the two populations do not
+    // even overlap: its 977 TEXT and ATTRIB entities carry 0.6 to 2.33,
+    // while its 519 MTEXTs carry 1,392 to 6,247,736. Feeding the second
+    // group into the first meaning stretched every paragraph on the sheet
+    // by thousands to millions and threw stray lines clear across the page.
+    let width_factor = if is_mtext {
+        if style.width_factor.is_finite() && style.width_factor > 0.0 {
+            style.width_factor
+        } else {
+            1.0
+        }
+    } else {
+        positive_or(entity, 41, style.width_factor, 1.0)
+    };
     let oblique = {
         let value = entity.f64(51, f64::NAN);
         let chosen = if value.is_finite() { value } else { style.oblique };
@@ -695,6 +714,81 @@ mod tests {
         let style = StyleRecord { fixed_height: 250.0, ..StyleRecord::default() };
         let g = lay_out(&ent, &style, &mut fonts, Codepage::Gbk).unwrap();
         assert!((bounds(&g).height() - 250.0).abs() < 2.0, "{:?}", bounds(&g));
+    }
+
+    /// Group 41 is a width factor on TEXT, but on MTEXT it is the
+    /// reference rectangle width in drawing units — the wrap width, not a
+    /// multiplier.
+    ///
+    /// Measured across the reference drawing: its 977 TEXT and ATTRIB
+    /// entities carry 0.6 to 2.33 there, while its 519 MTEXTs carry 1,392
+    /// to 6,247,736. Reading the latter as a factor stretched every
+    /// paragraph on the sheet by thousands to millions, which is what put
+    /// the stray lines across the page that AutoCAD's own plot does not
+    /// have.
+    #[test]
+    fn an_mtexts_group_41_is_a_wrap_width_not_a_width_factor() {
+        let Some(mut fonts) = simplex_pair() else { return };
+        let plain = entity(
+            "MTEXT",
+            &[
+                (1, Value::Str(b"AB".to_vec())),
+                (40, Value::F64(100.0)),
+                (10, Value::F64(0.0)),
+                (20, Value::F64(0.0)),
+            ],
+        );
+        let wrapped = entity(
+            "MTEXT",
+            &[
+                (1, Value::Str(b"AB".to_vec())),
+                (40, Value::F64(100.0)),
+                (41, Value::F64(50_000.0)),
+                (10, Value::F64(0.0)),
+                (20, Value::F64(0.0)),
+            ],
+        );
+        let style = StyleRecord::default();
+        let a = bounds(&lay_out(&plain, &style, &mut fonts, Codepage::Gbk).unwrap());
+        let b = bounds(&lay_out(&wrapped, &style, &mut fonts, Codepage::Gbk).unwrap());
+        assert!(
+            (a.width() - b.width()).abs() < 1.0,
+            "the reference rectangle width was applied as a multiplier: {} against {}",
+            b.width(),
+            a.width()
+        );
+    }
+
+    /// The style's own width factor still applies to MTEXT — it is only the
+    /// entity's group 41 that means something else there.
+    #[test]
+    fn an_mtext_still_honours_its_styles_width_factor() {
+        let Some(mut fonts) = simplex_pair() else { return };
+        let ent = entity(
+            "MTEXT",
+            &[
+                (1, Value::Str(b"MMM".to_vec())),
+                (40, Value::F64(100.0)),
+                (41, Value::F64(50_000.0)),
+                (10, Value::F64(0.0)),
+                (20, Value::F64(0.0)),
+            ],
+        );
+        let wide = bounds(&lay_out(&ent, &StyleRecord::default(), &mut fonts, Codepage::Gbk).unwrap());
+        let narrow = bounds(
+            &lay_out(
+                &ent,
+                &StyleRecord { width_factor: 0.7, ..StyleRecord::default() },
+                &mut fonts,
+                Codepage::Gbk,
+            )
+            .unwrap(),
+        );
+        assert!(
+            (narrow.width() / wide.width() - 0.7).abs() < 0.02,
+            "ratio {}",
+            narrow.width() / wide.width()
+        );
     }
 
     /// R-TXT-6.4: the measured width factors are 0.707, 0.7 and 0.8.
