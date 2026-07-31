@@ -39,7 +39,12 @@ fn scale_contours(source: &[Vec<Point>], factor: f64) -> Vec<Vec<Point>> {
 
 impl FontHandle {
     /// Draw a character from this font alone, if it has one.
-    fn char_geom(&mut self, ch: char, cp: Codepage) -> Option<CharGeom> {
+    ///
+    /// `as_bigfont` selects the key space, because the two font kinds do
+    /// not share one: a unifont is indexed by the character's own code
+    /// point, a big font by its codepage bytes. Using either font's key
+    /// on the other is how a degree sign becomes nothing.
+    fn char_geom(&mut self, ch: char, cp: Codepage, as_bigfont: bool) -> Option<CharGeom> {
         match self {
             FontHandle::None => None,
             FontHandle::Ttf(font) => {
@@ -52,12 +57,10 @@ impl FontHandle {
                 })
             }
             FontHandle::Shx(font) => {
-                // Single-byte characters index by their own code; anything
-                // else needs its codepage bytes (see `bigfont_code`).
-                let code = if (ch as u32) < 0x100 {
-                    ch as u16
-                } else {
+                let code = if as_bigfont {
                     bigfont_code(ch, cp)?
+                } else {
+                    u16::try_from(ch as u32).ok()?
                 };
                 if !font.has(code) {
                     return None;
@@ -75,32 +78,28 @@ impl FontHandle {
 }
 
 impl FontPair {
-    /// R-TXT-1.3: single-byte characters come from the primary font,
-    /// double-byte characters from the big font.
+    /// R-TXT-1.3: the big font draws what the drawing's codepage encodes
+    /// as two bytes; the primary draws everything else.
     ///
-    /// A missing glyph returns `None` rather than falling through to the
-    /// other font: the same numeric code means a different character in
-    /// each, so a fall-through draws confident nonsense.
+    /// That is the actual rule, and it is not "is it ASCII". In a GBK
+    /// drawing the degree sign encodes to two bytes (0xA1E3) and lives in
+    /// gbcbig, while simplex.shx carries it at its own code point 0xB0 —
+    /// so a 0x80 boundary reached neither font and dropped the character.
+    ///
+    /// The second attempt is not a fall-through to nonsense: each font is
+    /// queried in its own key space, so a miss is a genuine miss.
     pub fn char_geom(&mut self, ch: char, cp: Codepage) -> Option<CharGeom> {
-        if (ch as u32) < 0x80 {
-            // A space has no outline but still advances, so let the
-            // primary font answer even when it draws nothing.
-            if let Some(found) = self.primary.char_geom(ch, cp) {
+        let double_byte = bigfont_code(ch, cp).is_some();
+        if double_byte {
+            if let Some(found) = self.bigfont.char_geom(ch, cp, true) {
                 return Some(found);
             }
-            // A TrueType primary that lacks the character, or an SHX font
-            // missing an ASCII code, may still be covered by the big font.
-            return self.bigfont.char_geom(ch, cp);
+            return self.primary.char_geom(ch, cp, false);
         }
-        if let Some(found) = self.bigfont.char_geom(ch, cp) {
+        if let Some(found) = self.primary.char_geom(ch, cp, false) {
             return Some(found);
         }
-        // A TrueType primary covers CJK by itself; an SHX primary does not
-        // and will simply return None here.
-        match &self.primary {
-            FontHandle::Ttf(_) => self.primary.char_geom(ch, cp),
-            _ => None,
-        }
+        self.bigfont.char_geom(ch, cp, true)
     }
 }
 
@@ -199,5 +198,32 @@ mod tests {
         let g = pair.char_geom(' ', Codepage::Gbk).expect("a space still advances");
         assert!(g.contours.is_empty(), "a space drew ink");
         assert!(g.advance > 0.0, "a space did not advance");
+    }
+
+    /// The degree sign is what Task 8 emits for `%%d`, and CAD dimension
+    /// text is full of it. Every Latin SHX font carries it at its own
+    /// code point, and gbcbig carries it at its GBK code — a routing rule
+    /// that reaches neither drops it silently.
+    #[test]
+    fn extended_ascii_symbols_resolve_from_one_font_or_the_other() {
+        let (Some(primary), Some(bigfont)) = (shx("simplex.shx"), shx("gbcbig.shx")) else {
+            return;
+        };
+        let mut pair = FontPair { primary, bigfont };
+        for ch in ['\u{00B0}', '\u{00B1}'] {
+            let g = pair.char_geom(ch, Codepage::Gbk)
+                .unwrap_or_else(|| panic!("{ch:?} resolved to no glyph at all"));
+            assert!(!g.contours.is_empty(), "{ch:?} produced no geometry");
+        }
+    }
+
+    /// The same symbol must still resolve when the style has no big font,
+    /// this time from the primary's own code point.
+    #[test]
+    fn extended_ascii_resolves_from_the_primary_when_there_is_no_bigfont() {
+        let Some(primary) = shx("simplex.shx") else { return };
+        let mut pair = FontPair { primary, bigfont: FontHandle::None };
+        let g = pair.char_geom('\u{00B0}', Codepage::Gbk).expect("simplex has the degree sign");
+        assert!(!g.contours.is_empty());
     }
 }
