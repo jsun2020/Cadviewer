@@ -204,12 +204,24 @@ pub fn lay_out(
         _ => return None,
     };
 
-    // A style's non-zero fixed height wins over the entity's own.
-    let height = if style.fixed_height.is_finite() && style.fixed_height > 0.0 {
+    // The entity's own height wins; a style's fixed height is only the
+    // fallback for an entity that carries none.
+    //
+    // The reverse rule looks right from the DXF reference — a style's group
+    // 40 is documented as its "fixed text height" — and it is what this code
+    // did until the reference drawing disproved it. Its 31 title-block
+    // labels carry height 556.47 under style 图框文字说明, whose fixed height
+    // is 3.5; taking the style's shrank every one of them by a factor of
+    // 160, to ink three units tall in a cell six hundred units high, while
+    // AutoCAD's own PDF of the same sheet draws them filling their cells.
+    // The style's height constrains creation, not display.
+    let own = entity.f64(40, 0.0);
+    let height = if own.is_finite() && own > 0.0 {
+        own
+    } else if style.fixed_height.is_finite() && style.fixed_height > 0.0 {
         style.fixed_height
     } else {
-        let own = entity.f64(40, 0.0);
-        if own.is_finite() && own > 0.0 { own } else { return Some(TextGeom::default()) }
+        return Some(TextGeom::default());
     };
     let width_factor = positive_or(entity, 41, style.width_factor, 1.0);
     let oblique = {
@@ -565,13 +577,28 @@ mod tests {
         assert!((b.min_y - 300.0).abs() < 1.0, "min_y {}", b.min_y);
     }
 
-    /// R-TXT-3.1: a style's non-zero group 40 overrides the entity's own
-    /// height. Measured values in the reference drawing: 2.5, 3.0, 3.5,
-    /// 200.0, 250.0.
+    /// R-TXT-3.1: the entity's own height is what gets drawn, even when its
+    /// style carries a fixed height that disagrees.
+    ///
+    /// Measured on the reference drawing, where the two disagree by a
+    /// factor of 160: style 图框文字说明 fixes 3.5 while its 31 title-block
+    /// labels each carry 556.47, and AutoCAD's PDF draws them at the larger
+    /// size. Taking the style's height instead left them as specks.
     #[test]
-    fn a_styles_fixed_height_overrides_the_entitys() {
+    fn the_entitys_own_height_wins_over_its_styles_fixed_height() {
         let Some(mut fonts) = simplex_pair() else { return };
         let ent = text_entity("A", &[(40, Value::F64(100.0))]);
+        let style = StyleRecord { fixed_height: 3.5, ..StyleRecord::default() };
+        let g = lay_out(&ent, &style, &mut fonts, Codepage::Gbk).unwrap();
+        assert!((bounds(&g).height() - 100.0).abs() < 2.0, "{:?}", bounds(&g));
+    }
+
+    /// The style's fixed height is still the fallback for an entity that
+    /// carries none — without it such text would not be drawn at all.
+    #[test]
+    fn a_styles_fixed_height_is_used_when_the_entity_has_none() {
+        let Some(mut fonts) = simplex_pair() else { return };
+        let ent = text_entity("A", &[]);
         let style = StyleRecord { fixed_height: 250.0, ..StyleRecord::default() };
         let g = lay_out(&ent, &style, &mut fonts, Codepage::Gbk).unwrap();
         assert!((bounds(&g).height() - 250.0).abs() < 2.0, "{:?}", bounds(&g));

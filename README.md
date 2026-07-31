@@ -38,11 +38,16 @@ DXF 字节
 
 当前支持的主要实体包括 LINE、CIRCLE、ARC、ELLIPSE、LWPOLYLINE（含 bulge）、
 POLYLINE（含 VERTEX 序列）、SPLINE、POINT、SOLID、TRACE、3DFACE、LEADER、
-INSERT / MINSERT、块递归与 DIMENSION 几何块。
+INSERT / MINSERT、块递归、DIMENSION 几何块，以及文字 TEXT / MTEXT / ATTRIB。
+
+文字直接解析机器上已安装的 SHX 笔画字库（含 CJK 大字体）与 TrueType 字库，
+**程序自身不附带任何字库**——SHX 属 Autodesk 及第三方授权资产，一律在运行时
+就地查找。找不到原字库时按替代链顶替，并在警告区逐条写明"缺哪个、用了哪个、
+影响多少个实体"，绝不静默替换。可用 `--font-dir` 追加搜索目录。
 
 **尚未实现**（见 `prd.md` 与实现计划中的后续阶段）：
 
-- **文字（TEXT / MTEXT / ATTRIB）尚未绘制**——标题栏与标注文字目前为空白
+- 导出的 PDF 中文字是轮廓，不可检索、不可复制（P2）
 - HATCH 填充、MLINE、外部参照 XREF、三维实体、代理对象
 - CTB/STB 打印样式表读取、PDF 图层（OCG）
 

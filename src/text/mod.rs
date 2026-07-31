@@ -26,6 +26,9 @@ pub struct TextEngine {
     pairs: HashMap<String, FontPair>,
     /// Styles whose font could not be opened, reported once each.
     load_failures: Vec<String>,
+    /// Styles already given a big font they never named, so the fallback is
+    /// resolved and reported once rather than per entity.
+    unnamed_bigfont_styles: std::collections::HashSet<String>,
     /// Which substitutions each style's fonts triggered, by index into
     /// `resolver.substitutions()`. Recorded when the style is first
     /// resolved, so the per-entity tally below costs a map lookup rather
@@ -67,6 +70,7 @@ impl TextEngine {
             resolver: Resolver::new(search::FontSearch::for_drawing(drawing, extra_dirs)),
             pairs: HashMap::new(),
             load_failures: Vec::new(),
+            unnamed_bigfont_styles: std::collections::HashSet::new(),
             style_substitutions: HashMap::new(),
             entity_counts: HashMap::new(),
         }
@@ -113,9 +117,16 @@ impl TextEngine {
             let bigfont_ref = self.resolver.resolve(&style.bigfont, Role::Bigfont);
             let mut mine: Vec<usize> = (before..self.resolver.substitutions().len()).collect();
             // Pick up substitutions this style shares with an earlier one.
+            // Compared on the normalised name, not the raw string: a style
+            // spelling the font `HZTXT` shares the substitution recorded for
+            // `hztxt.shx`, and matching literally would drop its entities
+            // from that substitution's count.
+            let primary_key = search::normalized_key(&style.primary);
+            let bigfont_key = search::normalized_key(&style.bigfont);
             for (index, s) in self.resolver.substitutions().iter().enumerate() {
-                let shared = (s.role == Role::Primary && s.requested.eq_ignore_ascii_case(style.primary.trim()))
-                    || (s.role == Role::Bigfont && s.requested.eq_ignore_ascii_case(style.bigfont.trim()));
+                let key = search::normalized_key(&s.requested);
+                let shared = (s.role == Role::Primary && !key.is_empty() && key == primary_key)
+                    || (s.role == Role::Bigfont && !key.is_empty() && key == bigfont_key);
                 if shared && !mine.contains(&index) {
                     mine.push(index);
                 }
@@ -141,18 +152,74 @@ impl TextEngine {
     }
 
     /// Lay one entity out, or `None` if it is not a text entity.
+    /// Whether an entity's text contains a character only a big font can
+    /// draw, in this drawing's codepage.
+    ///
+    /// The test is "does it encode to two bytes", not "is it ASCII": in a
+    /// GBK drawing the degree sign is single-byte and lives in the primary,
+    /// while every Han character needs the big font. Both group 1 and the
+    /// group 3 continuation fragments an MTEXT splits its text across are
+    /// scanned, or a long paragraph whose Chinese begins after the first
+    /// 250 bytes would look Latin-only.
+    fn needs_bigfont(entity: &RawEntity, cp: Codepage) -> bool {
+        entity
+            .codes
+            .iter()
+            .filter(|(code, _)| *code == 1 || *code == 3)
+            .filter_map(|(_, value)| value.as_bytes())
+            .any(|bytes| {
+                crate::encoding::decode(bytes, cp)
+                    .chars()
+                    .any(|ch| crate::encoding::bigfont_code(ch, cp).is_some())
+            })
+    }
+
+    /// Give a style that names no big font one, once, when its text turns
+    /// out to need it. Attributed to the style so the warning carries the
+    /// entity count like every other substitution.
+    fn ensure_cjk_fallback(&mut self, key: &str, style_name: &str) {
+        if !self.unnamed_bigfont_styles.insert(key.to_owned()) {
+            return;
+        }
+        let resolved = self.resolver.bigfont_for_unnamed(style_name);
+        let index = self.resolver.substitutions().len() - 1;
+        self.style_substitutions.entry(key.to_owned()).or_default().push(index);
+        match open(&resolved) {
+            Ok(handle) => {
+                if let Some(pair) = self.pairs.get_mut(key) {
+                    pair.bigfont = handle;
+                }
+            }
+            Err(failure) => {
+                if !self.load_failures.contains(&failure) {
+                    self.load_failures.push(failure);
+                }
+            }
+        }
+    }
+
     pub fn lay_out(&mut self, entity: &RawEntity) -> Option<TextGeom> {
         if !matches!(entity.kind.as_str(), "TEXT" | "MTEXT" | "ATTRIB") {
             return None;
         }
         let style = self.style_for(entity);
         let codepage = self.codepage;
+        let key = style.name.to_ascii_uppercase();
+        // Only when the style names no big font at all. One that names a
+        // missing font has already been through the substitution chain and
+        // reported; running it again would say the same thing twice.
+        let unnamed_bigfont = style.bigfont.trim().is_empty()
+            && matches!(self.pair_for(&style).bigfont, FontHandle::None);
+        if unnamed_bigfont && Self::needs_bigfont(entity, codepage) {
+            let name = if style.name.is_empty() { "(未命名)" } else { style.name.as_str() };
+            let name = name.to_owned();
+            self.ensure_cjk_fallback(&key, &name);
+        }
         let pair = self.pair_for(&style);
         let laid = layout::lay_out(entity, &style, pair, codepage);
         // Tally after the pair exists, so `style_substitutions` is
         // populated. Counted per entity laid out, which is what R-TXT-2.3
         // asks for — not per style and not per glyph.
-        let key = style.name.to_ascii_uppercase();
         if let Some(indices) = self.style_substitutions.get(&key) {
             for index in indices.clone() {
                 *self.entity_counts.entry(index).or_default() += 1;

@@ -31,6 +31,19 @@ mod tests {
         assert_eq!(candidate_filenames("../fonts/gbcbig.shx"), vec!["gbcbig.shx".to_owned()]);
     }
 
+    /// Measured on the reference drawing: one missing big font is named
+    /// both `hztxt.shx` and `HZTXT` by different styles, and must resolve to
+    /// one identity so it is reported once with one entity count.
+    #[test]
+    fn every_spelling_of_one_font_shares_a_key() {
+        let key = normalized_key("hztxt.shx");
+        assert_eq!(normalized_key("HZTXT"), key);
+        assert_eq!(normalized_key(" hztxt "), key);
+        assert_eq!(normalized_key("C:\\Fonts\\HzTxt.SHX"), key);
+        assert_ne!(normalized_key("gbcbig.shx"), key);
+        assert!(normalized_key("  ").is_empty());
+    }
+
     #[test]
     fn the_drawings_own_directory_is_searched() {
         let dir = tempfile::tempdir().unwrap();
@@ -115,6 +128,21 @@ pub fn candidate_filenames(reference: &str) -> Vec<String> {
     } else {
         vec![format!("{name}.shx")]
     }
+}
+
+/// One identity for every spelling of the same font.
+///
+/// The reference drawing names one and the same missing big font as both
+/// `hztxt.shx` and `HZTXT`, and a drawing authored elsewhere may spell it
+/// as a full path. Keying caches and warnings on the raw string makes that
+/// read as two missing fonts, splits the affected-entity count R-TXT-2.3
+/// asks for across both lines, and searches the disk twice for a file that
+/// is not there. Empty for a reference that names nothing.
+pub fn normalized_key(reference: &str) -> String {
+    candidate_filenames(reference)
+        .first()
+        .map(|name| name.to_ascii_uppercase())
+        .unwrap_or_default()
 }
 
 fn cad_font_dirs() -> Vec<PathBuf> {

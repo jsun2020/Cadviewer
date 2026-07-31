@@ -25,6 +25,11 @@ pub struct Substitution {
     pub requested: String,
     pub role: Role,
     pub used: Resolved,
+    /// Set when the style named no big font at all, rather than naming one
+    /// that is missing. Then `requested` is empty and this carries the
+    /// style's name, because that is the only thing worth telling the user:
+    /// there is no font to go and install.
+    pub unnamed_style: Option<String>,
 }
 
 /// Stroke fonts tried, in order, when a big font is missing.
@@ -52,9 +57,11 @@ const UNNAMED_PRIMARY_DEFAULT: &str = "txt.shx";
 
 pub struct Resolver {
     search: FontSearch,
-    /// Keyed by (upper-case reference, role) so a repeated lookup is
+    /// Keyed by (normalised font name, role) so a repeated lookup is
     /// neither re-searched nor re-warned. The reference drawing asks for
-    /// the same broken style 504 times.
+    /// the same broken style 504 times, and names one missing font both
+    /// `hztxt.shx` and `HZTXT` — the normalisation is what keeps those from
+    /// becoming two warnings about two fonts.
     cache: HashMap<(String, Role), Resolved>,
     substitutions: Vec<Substitution>,
 }
@@ -74,7 +81,7 @@ impl Resolver {
     }
 
     pub fn resolve(&mut self, reference: &str, role: Role) -> Resolved {
-        let key = (reference.trim().to_ascii_uppercase(), role);
+        let key = (crate::text::search::normalized_key(reference), role);
         if let Some(hit) = self.cache.get(&key) {
             return hit.clone();
         }
@@ -101,6 +108,7 @@ impl Resolver {
                             requested: UNNAMED_PRIMARY_DEFAULT.to_owned(),
                             role,
                             used: Resolved::None,
+                            unnamed_style: None,
                         });
                         Resolved::None
                     }
@@ -139,6 +147,43 @@ impl Resolver {
             requested: trimmed.to_owned(),
             role,
             used: used.clone(),
+            unnamed_style: None,
+        });
+        used
+    }
+
+    /// A big font for a style that names none, for text that turns out to
+    /// need one.
+    ///
+    /// An empty group 4 is not an error and must not warn on its own — most
+    /// Latin styles have one. But 38 of the reference drawing's styles name
+    /// no font at all, and 144 of its entities are Chinese drawn in them,
+    /// including the sheet's own title: with a Latin primary and no big
+    /// font, every one of those characters silently produced nothing.
+    /// Vanishing text with no message is the failure R-TXT-2.3 exists to
+    /// prevent, so the same chain a missing big font would take is walked
+    /// here, and reported.
+    pub fn bigfont_for_unnamed(&mut self, style: &str) -> Resolved {
+        let mut used = Resolved::None;
+        for candidate in BIGFONT_SUBSTITUTES {
+            if let Some(found) = self.locate(candidate) {
+                used = found;
+                break;
+            }
+        }
+        if used == Resolved::None {
+            for (candidate, index) in TTF_FALLBACKS {
+                if let Some(path) = self.search.find(candidate) {
+                    used = Resolved::Ttf(path, index);
+                    break;
+                }
+            }
+        }
+        self.substitutions.push(Substitution {
+            requested: String::new(),
+            role: Role::Bigfont,
+            used: used.clone(),
+            unnamed_style: Some(style.to_owned()),
         });
         used
     }
@@ -158,6 +203,17 @@ impl Substitution {
             Role::Primary => "主字库",
             Role::Bigfont => "大字体",
         };
+        if let Some(style) = &self.unnamed_style {
+            return match &self.used {
+                Resolved::Shx(path) | Resolved::Ttf(path, _) => format!(
+                    "样式 {style} 未指定大字体，中文已用 {} 绘制",
+                    path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()
+                ),
+                Resolved::None => {
+                    format!("样式 {style} 未指定大字体，且找不到任何中文字库，中文无法绘制")
+                }
+            };
+        }
         match &self.used {
             Resolved::Shx(path) | Resolved::Ttf(path, _) => format!(
                 "缺少{half} {}，已替代为 {}",
