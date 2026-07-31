@@ -1,5 +1,6 @@
 use std::path::{Path, PathBuf};
 
+use cadviewer::shx::ShxFont;
 use cadviewer::shx::container::{ShxKind, parse_container};
 
 /// AutoCAD's font directory. Local-only: these files are licensed assets
@@ -70,4 +71,90 @@ fn bigfont_index_matches_the_measured_layout() {
         font.glyphs[&0xD2BB],
         vec![0x07, 0x8E, 0x05, 0x02, 0x08, 0x05, 0x26, 0x01, 0x08, 0x38, 0x04, 0x07, 0x8F, 0x00]
     );
+}
+
+fn font(name: &str) -> Option<ShxFont> {
+    let bytes = load(name)?;
+    Some(ShxFont::load(&bytes).expect("real fonts must load"))
+}
+
+/// R-TXT-6.1: a Latin glyph is exactly one em tall and its advance is
+/// wider than its ink. Measured: simplex 'A' bbox (0,0)-(16,21),
+/// advance 22; 'X' and '0' are 14 wide with advance 20.
+#[test]
+fn simplex_glyph_metrics_match_the_measured_values() {
+    let Some(mut f) = font("simplex.shx") else { return };
+    assert_eq!(f.em(), 21.0);
+    for (ch, width, advance) in [('A', 16.0, 22.0), ('X', 14.0, 20.0), ('0', 14.0, 20.0)] {
+        let outline = f.glyph(ch as u16);
+        let mut b = cadviewer::geom::Bounds::empty();
+        for stroke in &outline.strokes {
+            for p in stroke {
+                b.add(*p);
+            }
+        }
+        assert!((b.height() - 21.0).abs() < 0.01, "'{ch}' is {} tall, expected the em", b.height());
+        assert!((b.width() - width).abs() < 0.01, "'{ch}' is {} wide", b.width());
+        assert!(
+            (outline.advance - advance).abs() < 0.01,
+            "'{ch}' advance {} — the advance is the pen's final x, not the bbox",
+            outline.advance
+        );
+    }
+}
+
+/// R-TXT-6.1 for the CJK half. `gbcbig.shx`'s font record is
+/// `00 40 02 00`, so `above` reads as 0 and the fallback em applies —
+/// which would size every Chinese character wrongly.
+///
+/// This test calibrates the real em by measurement: interpret three
+/// full-width characters and assert their heights agree with each other,
+/// then assert the advance of a full-width character is close to one em.
+/// If it fails, read the printed numbers and set the bigfont em from them
+/// in `ShxFont::load`; do not guess.
+#[test]
+fn gbcbig_full_width_glyphs_share_one_em() {
+    let Some(mut f) = font("gbcbig.shx") else { return };
+    let mut heights = Vec::new();
+    let mut advances = Vec::new();
+    // 图 纸 说 明 — four dense full-width characters from the title block.
+    for code in [0xCDBCu16, 0xD6BD, 0xCBB5, 0xC3F7] {
+        let outline = f.glyph(code);
+        let mut b = cadviewer::geom::Bounds::empty();
+        for stroke in &outline.strokes {
+            for p in stroke {
+                b.add(*p);
+            }
+        }
+        assert!(b.valid(), "glyph {code:#06X} produced no geometry");
+        heights.push(b.height());
+        advances.push(outline.advance);
+    }
+    eprintln!("gbcbig heights {heights:?} advances {advances:?} em {}", f.em());
+    let max = heights.iter().cloned().fold(f64::MIN, f64::max);
+    let min = heights.iter().cloned().fold(f64::MAX, f64::min);
+    assert!(max / min < 1.25, "full-width glyphs disagree about height: {heights:?}");
+    let advance = advances[0];
+    assert!(
+        advance > 0.0 && (advance / f.em() - 1.0).abs() < 0.25,
+        "a full-width advance of {advance} against an em of {} is not one em",
+        f.em()
+    );
+}
+
+/// R-TXT-1.4 against a real file: every glyph in the largest shipped font
+/// must terminate. This is the test that would catch an unbounded loop
+/// reaching production.
+#[test]
+fn every_gbcbig_glyph_terminates() {
+    let Some(mut f) = font("gbcbig.shx") else { return };
+    let start = std::time::Instant::now();
+    let mut drawn = 0usize;
+    for code in 0xA1A1u16..=0xA3FE {
+        if f.has(code) && !f.glyph(code).strokes.is_empty() {
+            drawn += 1;
+        }
+    }
+    assert!(drawn > 100, "only {drawn} glyphs produced geometry — the interpreter is not working");
+    assert!(start.elapsed().as_secs() < 20, "interpreting one GBK block took {:?}", start.elapsed());
 }
