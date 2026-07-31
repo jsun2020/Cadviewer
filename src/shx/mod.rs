@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::rc::Rc;
+use std::sync::Arc;
 
 pub mod container;
 pub mod interp;
@@ -40,7 +40,11 @@ fn bigfont_em(raw: &RawFont) -> f64 {
 pub struct ShxFont {
     raw: RawFont,
     em: f64,
-    cache: HashMap<u16, Rc<Outline>>,
+    /// `Arc` rather than `Rc` so a loaded font can cross a thread boundary:
+    /// the viewer hands its whole text engine to the background rebuild it
+    /// runs on every sheet switch, and re-reading `gbcbig.shx` (900 KB,
+    /// 7,703 glyph records) per switch is what this cache exists to avoid.
+    cache: HashMap<u16, Arc<Outline>>,
 }
 
 impl ShxFont {
@@ -79,15 +83,15 @@ impl ShxFont {
     /// times — the reference sheet has 1,257 TEXT entities alone — so
     /// re-running the interpreter per occurrence is the difference between
     /// milliseconds and minutes.
-    pub fn glyph(&mut self, code: u16) -> Rc<Outline> {
+    pub fn glyph(&mut self, code: u16) -> Arc<Outline> {
         if let Some(hit) = self.cache.get(&code) {
-            return Rc::clone(hit);
+            return Arc::clone(hit);
         }
-        let outline = Rc::new(
+        let outline = Arc::new(
             Interp { glyphs: &self.raw.glyphs, wide_subshape: self.raw.kind == ShxKind::Unifont }
                 .run(code),
         );
-        self.cache.insert(code, Rc::clone(&outline));
+        self.cache.insert(code, Arc::clone(&outline));
         outline
     }
 }
@@ -131,7 +135,7 @@ mod tests {
         let mut f = ShxFont::load(&tiny_unifont(21)).unwrap();
         let a = f.glyph(0x41);
         let b = f.glyph(0x41);
-        assert!(std::rc::Rc::ptr_eq(&a, &b), "the second lookup re-interpreted the glyph");
+        assert!(std::sync::Arc::ptr_eq(&a, &b), "the second lookup re-interpreted the glyph");
     }
 
     #[test]

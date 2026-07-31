@@ -4,7 +4,8 @@ use std::process::ExitCode;
 use cadviewer::converter::{ConvertOptions, convert_to_pdf};
 use cadviewer::plot::style::ColorMode;
 
-const USAGE: &str = "用法：Cadconvert.exe <input.dwg|dxf> <output.pdf> [--mono] [--all|--sheet N]";
+const USAGE: &str =
+    "用法：Cadconvert.exe <input.dwg|dxf> <output.pdf> [--mono] [--all|--sheet N] [--font-dir <path>]";
 
 /// R-CLI exit codes: 1 input error, 2 decode failure, 3 nothing to print.
 const EXIT_INPUT: u8 = 1;
@@ -30,8 +31,14 @@ fn main() -> ExitCode {
     };
 
     match convert_to_pdf(&PathBuf::from(input), &PathBuf::from(output), &options) {
-        Ok(pages) => {
+        Ok((pages, warnings)) => {
             println!("已导出 {pages} 页");
+            // R-TXT-2.3: a substituted font must never be invisible from the
+            // command line — the page still exports, but not in the font the
+            // drawing asked for.
+            for warning in &warnings {
+                eprintln!("警告：{warning}");
+            }
             ExitCode::SUCCESS
         }
         Err(error) => {
@@ -63,6 +70,11 @@ fn parse_options(args: &[String]) -> Result<ConvertOptions, String> {
                     return Err("图纸编号从 1 开始".to_owned());
                 }
                 options.sheet = Some(index);
+                i += 1;
+            }
+            "--font-dir" => {
+                let value = args.get(i + 1).ok_or("--font-dir 需要一个目录")?;
+                options.font_dirs.push(PathBuf::from(value));
                 i += 1;
             }
             other => return Err(format!("未知选项 {other:?}")),
@@ -106,5 +118,25 @@ mod tests {
     #[test]
     fn unknown_flags_are_rejected_rather_than_ignored() {
         assert!(parse_options(&args(&["--colour"])).is_err());
+    }
+
+    /// R-CLI: `--font-dir` appends a search directory (R-TXT-2.1 step 4).
+    #[test]
+    fn font_dir_is_collected() {
+        let options = parse_options(&args(&["--font-dir", "C:\\fonts"])).unwrap();
+        assert_eq!(options.font_dirs, vec![PathBuf::from("C:\\fonts")]);
+    }
+
+    #[test]
+    fn font_dir_may_be_repeated() {
+        let options = parse_options(&args(&["--font-dir", "A", "--font-dir", "B"])).unwrap();
+        assert_eq!(options.font_dirs.len(), 2);
+    }
+
+    /// A flag that cannot be honoured must be an error, not ignored — the
+    /// defect fixed in commit 12ea4bd.
+    #[test]
+    fn font_dir_without_a_value_is_rejected() {
+        assert!(parse_options(&args(&["--font-dir"])).is_err());
     }
 }

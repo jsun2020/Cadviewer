@@ -55,6 +55,36 @@ Copy-Item -Recurse -LiteralPath (Join-Path $ProjectRoot 'scripts') -Destination 
 foreach ($File in 'Cargo.toml','Cargo.lock','README.md','THIRD_PARTY_NOTICES.md','LICENSE') {
     Copy-Item -LiteralPath (Join-Path $ProjectRoot $File) -Destination $SourceStage
 }
+# R-TXT-5.3: SHX fonts are Autodesk/third-party licensed assets and TTFs are
+# Microsoft's. Every font this program uses is located on the user's machine
+# at runtime; none is ever shipped. Assert that, rather than trusting nobody
+# copied one in.
+function Get-FontFiles([string]$Root) {
+    @(Get-ChildItem -Path $Root -Recurse -File |
+        Where-Object { $_.Extension -match '^\.(shx|ttf|ttc|otf)$' })
+}
+
+function Assert-NoFonts([string]$Root, [string]$What) {
+    $Forbidden = Get-FontFiles $Root
+    if ($Forbidden) {
+        throw "Refusing to package font files into ${What}: $($Forbidden.FullName -join ', ')"
+    }
+
+    # Control assertion: a check that cannot fire is not a check. Plant a file
+    # the gate must catch, confirm it does, then remove it. LL-032/LL-033 both
+    # shipped leak gates that silently matched nothing and read as "clean".
+    $Canary = Join-Path $Root 'canary.shx'
+    Set-Content -LiteralPath $Canary -Value 'x'
+    $Caught = (Get-FontFiles $Root).Count
+    Remove-Item -Force -LiteralPath $Canary
+    if ($Caught -eq 0) {
+        throw "The font leak gate did not fire on a planted .shx in ${What}; the check is vacuous."
+    }
+}
+
+# Checked before each archive is written, not after: a gate that throws once
+# the zip already exists leaves the leaking artifact sitting on disk.
+Assert-NoFonts $SourceStage 'the source zip'
 Compress-Archive -Force -Path (Join-Path $SourceStage '*') -DestinationPath (Join-Path $PackageDir 'source\Cadviewer-source.zip')
 Remove-Item -Recurse -Force -LiteralPath $SourceStage
 
@@ -62,5 +92,6 @@ $ZipPath = Join-Path $DistRoot 'Cadviewer-portable-win64.zip'
 if (Test-Path -LiteralPath $ZipPath) {
     Remove-Item -Force -LiteralPath $ZipPath
 }
+Assert-NoFonts $PackageDir 'the portable package'
 Compress-Archive -Force -Path $PackageDir -DestinationPath $ZipPath
 Write-Host "Portable package: $ZipPath"

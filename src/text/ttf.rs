@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::rc::Rc;
+use std::sync::Arc;
 
 use ttf_parser::{Face, OutlineBuilder};
 
@@ -26,7 +26,9 @@ pub struct TtfFont {
     data: Vec<u8>,
     face_index: u32,
     em: f64,
-    cache: HashMap<char, Option<Rc<TtfGlyph>>>,
+    /// `Arc` rather than `Rc` for the same reason as `ShxFont`'s cache: the
+    /// viewer moves the whole text engine into its rebuild thread.
+    cache: HashMap<char, Option<Arc<TtfGlyph>>>,
 }
 
 /// Collects `ttf-parser`'s outline callbacks into polylines.
@@ -114,7 +116,7 @@ impl TtfFont {
         self.em
     }
 
-    pub fn glyph(&mut self, ch: char) -> Option<Rc<TtfGlyph>> {
+    pub fn glyph(&mut self, ch: char) -> Option<Arc<TtfGlyph>> {
         if let Some(hit) = self.cache.get(&ch) {
             return hit.clone();
         }
@@ -123,7 +125,7 @@ impl TtfFont {
         built
     }
 
-    fn build(&self, ch: char) -> Option<Rc<TtfGlyph>> {
+    fn build(&self, ch: char) -> Option<Arc<TtfGlyph>> {
         let face = Face::parse(&self.data, self.face_index).ok()?;
         let id = face.glyph_index(ch)?;
         let advance = f64::from(face.glyph_hor_advance(id).unwrap_or(0));
@@ -132,7 +134,7 @@ impl TtfFont {
         // empty outline is a success, not a miss.
         face.outline_glyph(id, &mut builder);
         builder.flush();
-        Some(Rc::new(TtfGlyph { contours: builder.contours, advance }))
+        Some(Arc::new(TtfGlyph { contours: builder.contours, advance }))
     }
 }
 
@@ -213,7 +215,7 @@ mod tests {
         let mut f = TtfFont::load(bytes, 0).unwrap();
         let a = f.glyph('A').unwrap();
         let b = f.glyph('A').unwrap();
-        assert!(std::rc::Rc::ptr_eq(&a, &b));
+        assert!(std::sync::Arc::ptr_eq(&a, &b));
     }
 
     #[test]

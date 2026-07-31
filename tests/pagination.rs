@@ -23,16 +23,16 @@ fn multi_sheet_source() -> Vec<u8> {
 #[test]
 fn emits_one_scene_per_detected_frame() {
     let doc = Document::parse(&multi_sheet_source()).unwrap();
-    let opts = ConvertOptions { mode: ColorMode::Color, sheet: None };
-    let scenes = scenes_for(&doc, &opts).expect("should produce scenes");
+    let opts = ConvertOptions { mode: ColorMode::Color, sheet: None, font_dirs: Vec::new() };
+    let (scenes, _) = scenes_for(&doc, &opts, None).expect("should produce scenes");
     assert_eq!(scenes.len(), 4, "the group box must not add a fifth page");
 }
 
 #[test]
 fn each_page_is_sized_for_its_frame_not_the_whole_drawing() {
     let doc = Document::parse(&multi_sheet_source()).unwrap();
-    let opts = ConvertOptions { mode: ColorMode::Color, sheet: None };
-    let scenes = scenes_for(&doc, &opts).unwrap();
+    let opts = ConvertOptions { mode: ColorMode::Color, sheet: None, font_dirs: Vec::new() };
+    let (scenes, _) = scenes_for(&doc, &opts, None).unwrap();
     for s in &scenes {
         // A 420x297 frame is A3 landscape.
         assert!((s.paper.width_mm - 420.0).abs() < 1.0, "got {}", s.paper.width_mm);
@@ -43,22 +43,22 @@ fn each_page_is_sized_for_its_frame_not_the_whole_drawing() {
 #[test]
 fn a_single_sheet_can_be_selected() {
     let doc = Document::parse(&multi_sheet_source()).unwrap();
-    let opts = ConvertOptions { mode: ColorMode::Color, sheet: Some(2) };
-    assert_eq!(scenes_for(&doc, &opts).unwrap().len(), 1);
+    let opts = ConvertOptions { mode: ColorMode::Color, sheet: Some(2), font_dirs: Vec::new() };
+    assert_eq!(scenes_for(&doc, &opts, None).unwrap().0.len(), 1);
 }
 
 #[test]
 fn selecting_a_nonexistent_sheet_is_an_error_not_an_empty_pdf() {
     let doc = Document::parse(&multi_sheet_source()).unwrap();
-    let opts = ConvertOptions { mode: ColorMode::Color, sheet: Some(99) };
-    assert!(scenes_for(&doc, &opts).is_err());
+    let opts = ConvertOptions { mode: ColorMode::Color, sheet: Some(99), font_dirs: Vec::new() };
+    assert!(scenes_for(&doc, &opts, None).is_err());
 }
 
 #[test]
 fn drawings_without_frames_still_produce_one_page() {
     let src = b"  0\nSECTION\n  2\nENTITIES\n  0\nLINE\n  8\n0\n 10\n0.0\n 20\n0.0\n 11\n100.0\n 21\n100.0\n  0\nENDSEC\n  0\nEOF\n";
     let doc = Document::parse(src).unwrap();
-    let opts = ConvertOptions { mode: ColorMode::Color, sheet: None };
-    let scenes = scenes_for(&doc, &opts).expect("must never fail on a frameless drawing");
+    let opts = ConvertOptions { mode: ColorMode::Color, sheet: None, font_dirs: Vec::new() };
+    let (scenes, _) = scenes_for(&doc, &opts, None).expect("must never fail on a frameless drawing");
     assert_eq!(scenes.len(), 1);
 }

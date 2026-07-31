@@ -2,14 +2,15 @@
 
 use cadviewer::converter;
 use cadviewer::doc::Document;
-use cadviewer::plot::build::{BuildReport, PlotRequest, build, model_extents};
+use cadviewer::plot::build::{BuildReport, PlotRequest, build_with_text, model_extents};
 use cadviewer::plot::style::ColorMode;
 use cadviewer::plot::{PaperSize, PlotScene};
 use cadviewer::render::skia;
 use cadviewer::sheets::Sheet;
+use cadviewer::text::TextEngine;
 use eframe::egui;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::{Duration, Instant};
 
@@ -105,7 +106,8 @@ fn sheet_request(
 }
 
 /// Entity kinds the builder could not draw, with counts, for the warnings
-/// area. TEXT and MTEXT are expected here until the text phase lands.
+/// area. TEXT/MTEXT/ATTRIB appear here only when no font could be resolved
+/// at all.
 fn skipped_summary(report: &BuildReport) -> String {
     if report.skipped.is_empty() {
         return String::new();
@@ -128,9 +130,16 @@ struct LoadedDocument {
     sheets: Vec<Sheet>,
     scene: Arc<PlotScene>,
     item_count: usize,
+    /// The document's fonts, resolved and loaded once. Shared with the
+    /// background rebuild thread rather than rebuilt per sheet, or every
+    /// sheet switch would re-read 900 KB of `gbcbig.shx`.
+    text: Arc<Mutex<TextEngine>>,
     /// Loader warnings (LibreDWG stderr), held apart from the per-build
     /// skipped summary so switching sheets cannot accumulate copies of it.
     load_warnings: String,
+    /// Font substitutions (R-TXT-2.3), likewise held apart: they are a
+    /// property of the document, not of the sheet being drawn.
+    font_warnings: String,
     skipped: String,
 }
 
@@ -141,6 +150,11 @@ struct BuiltScene {
     scene: Arc<PlotScene>,
     item_count: usize,
     skipped: String,
+    /// Re-read after the build: a sheet can be the first to use a style, so
+    /// the substitution list and its per-entity counts both grow as sheets
+    /// are visited. Carrying it back keeps the warnings area current instead
+    /// of frozen at whatever the first sheet happened to need.
+    font_warnings: String,
 }
 
 enum AppMessage {
@@ -260,15 +274,26 @@ impl CadviewerApp {
             format!("正在绘制第 {} 页…", self.active_sheet + 1)
         };
         let doc = Arc::clone(&document.doc);
+        let text = Arc::clone(&document.text);
         let generation = self.generation;
         let sender = self.sender.clone();
         let context = context.clone();
         std::thread::spawn(move || {
-            let (scene, report) = build(&doc, &request);
+            // Only one rebuild runs at a time (the `rebuilding` guard above),
+            // so this lock is never contended; it exists to share the loaded
+            // fonts with the thread, not to serialise anything. A poisoned
+            // lock is recovered rather than propagated: the engine holds
+            // caches and counters, so a half-finished rebuild leaves it
+            // usable, and panicking here would make one failed sheet break
+            // every later one.
+            let mut engine = text.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let (scene, report) = build_with_text(&doc, &request, Some(&mut engine));
+            let font_warnings = engine.warnings().join("\n");
             let _ = sender.send(AppMessage::Rebuilt(BuiltScene {
                 generation,
                 item_count: report.items,
                 skipped: skipped_summary(&report),
+                font_warnings,
                 scene: Arc::new(scene),
             }));
             context.request_repaint();
@@ -286,11 +311,20 @@ impl CadviewerApp {
         // PDF cannot differ from what `Cadconvert.exe` would produce; the
         // preview matches it because `sheet_request` mirrors its window and
         // paper choice.
-        let options = converter::ConvertOptions { mode: self.color_mode, sheet };
+        let options = converter::ConvertOptions {
+            mode: self.color_mode,
+            sheet,
+            // The viewer has no --font-dir of its own; the export searches
+            // the same places the preview did.
+            font_dirs: Vec::new(),
+        };
         let sender = self.sender.clone();
         let context = context.clone();
         std::thread::spawn(move || {
+            // The substitution warnings are already on screen from the load,
+            // so the export does not repeat them.
             let result = converter::convert_to_pdf(&source, &path, &options)
+                .map(|(pages, _warnings)| pages)
                 .map_err(|error| error.to_string());
             let _ = sender.send(AppMessage::Exported { path, result });
             context.request_repaint();
@@ -330,6 +364,7 @@ impl CadviewerApp {
                         document.scene = built.scene;
                         document.item_count = built.item_count;
                         document.skipped = built.skipped;
+                        document.font_warnings = built.font_warnings;
                     }
                     self.fit_requested = true;
                     self.render_dirty = true;
@@ -367,12 +402,16 @@ impl CadviewerApp {
             document.doc.entities.len(),
             document.item_count
         );
-        self.warnings = [document.load_warnings.as_str(), document.skipped.as_str()]
-            .iter()
-            .filter(|part| !part.is_empty())
-            .copied()
-            .collect::<Vec<_>>()
-            .join("\n");
+        self.warnings = [
+            document.load_warnings.as_str(),
+            document.font_warnings.as_str(),
+            document.skipped.as_str(),
+        ]
+        .iter()
+        .filter(|part| !part.is_empty())
+        .copied()
+        .collect::<Vec<_>>()
+        .join("\n");
     }
 
     fn open_dialog(&mut self, context: &egui::Context) {
@@ -735,7 +774,10 @@ fn load_document(path: &Path, mode: ColorMode) -> Result<LoadedDocument, String>
     let sheets = cadviewer::sheets::detect(&doc);
     let request = sheet_request(&doc, &sheets, 0, mode)
         .ok_or_else(|| "图纸中没有可打印的二维实体".to_owned())?;
-    let (scene, report) = build(&doc, &request);
+    // The drawing's own directory is one of the font search paths
+    // (R-TXT-2.1 step 2), so the engine needs the file it came from.
+    let mut text = TextEngine::new(&doc, Some(path), &[]);
+    let (scene, report) = build_with_text(&doc, &request, Some(&mut text));
     Ok(LoadedDocument {
         source: path.to_owned(),
         doc: Arc::new(doc),
@@ -743,6 +785,8 @@ fn load_document(path: &Path, mode: ColorMode) -> Result<LoadedDocument, String>
         scene: Arc::new(scene),
         item_count: report.items,
         load_warnings: loaded.warnings,
+        font_warnings: text.warnings().join("\n"),
+        text: Arc::new(Mutex::new(text)),
         skipped: skipped_summary(&report),
     })
 }

@@ -8,7 +8,7 @@ use std::os::windows::process::CommandExt;
 
 use crate::doc::Document;
 use crate::plot::PaperSize;
-use crate::plot::build::{BuildReport, PlotRequest, build, model_extents};
+use crate::plot::build::{BuildReport, PlotRequest, build, build_with_text, model_extents};
 use crate::plot::style::ColorMode;
 use crate::plot::PlotScene;
 use crate::render::pdf::write_pdf;
@@ -173,11 +173,13 @@ pub struct ConvertOptions {
     pub mode: ColorMode,
     /// 1-based page selection. `None` exports every sheet.
     pub sheet: Option<usize>,
+    /// Extra SHX search directories from `--font-dir` (R-TXT-2.1 step 4).
+    pub font_dirs: Vec<PathBuf>,
 }
 
 impl Default for ConvertOptions {
     fn default() -> Self {
-        Self { mode: ColorMode::Color, sheet: None }
+        Self { mode: ColorMode::Color, sheet: None, font_dirs: Vec::new() }
     }
 }
 
@@ -186,11 +188,18 @@ impl Default for ConvertOptions {
 /// Paper size and plot scale come from the frame's own dimensions fitted to
 /// a standard sheet. The title block's printed scale text is deliberately
 /// ignored: it records the drawing scale, not the plot scale (PRD 3.10.3).
+/// `drawing` is the input file's own path, which the font search uses as
+/// one of its directories (R-TXT-2.1 step 2); `None` simply drops that step.
+/// The returned warnings are the text engine's substitution list (R-TXT-2.3).
 pub fn scenes_for(
     doc: &Document,
     options: &ConvertOptions,
-) -> Result<Vec<PlotScene>, ConvertError> {
+    drawing: Option<&Path>,
+) -> Result<(Vec<PlotScene>, Vec<String>), ConvertError> {
     let mut sheets = detect(doc);
+    // One engine for the whole document: a drawing has tens of styles and
+    // thousands of text entities, and `gbcbig.shx` alone is 900 KB.
+    let mut text = crate::text::TextEngine::new(doc, drawing, &options.font_dirs);
 
     if sheets.is_empty() {
         // R-SHEET-6: never fail, fall back to the whole model space.
@@ -204,8 +213,8 @@ pub fn scenes_for(
             margin_mm: DEFAULT_MARGIN_MM,
             mode: options.mode,
         };
-        let (scene, _) = build(doc, &req);
-        return Ok(vec![scene]);
+        let (scene, _) = build_with_text(doc, &req, Some(&mut text));
+        return Ok((vec![scene], text.warnings()));
     }
 
     if let Some(index) = options.sheet {
@@ -234,26 +243,26 @@ pub fn scenes_for(
             margin_mm: DEFAULT_MARGIN_MM,
             mode: options.mode,
         };
-        let (scene, _) = build(doc, &req);
+        let (scene, _) = build_with_text(doc, &req, Some(&mut text));
         scenes.push(scene);
     }
-    Ok(scenes)
+    Ok((scenes, text.warnings()))
 }
 
 /// Convert to a PDF with one page per detected title-block frame (or a
 /// single page covering model extents when none are found), returning the
-/// page count.
+/// page count and the font substitution warnings.
 pub fn convert_to_pdf(
     input: &Path,
     output: &Path,
     options: &ConvertOptions,
-) -> Result<usize, ConvertError> {
+) -> Result<(usize, Vec<String>), ConvertError> {
     let loaded = load(input)?;
-    let scenes = scenes_for(&loaded.doc, options)?;
+    let (scenes, warnings) = scenes_for(&loaded.doc, options, Some(input))?;
     let bytes = write_pdf(&scenes);
     fs::write(output, bytes)
         .map_err(|e| ConvertError::input(format!("无法写入 PDF：{e}")))?;
-    Ok(scenes.len())
+    Ok((scenes.len(), warnings))
 }
 
 fn locate_converter() -> Result<PathBuf, ConvertError> {
