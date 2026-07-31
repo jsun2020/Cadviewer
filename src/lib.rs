@@ -7,3 +7,4 @@ pub mod geom;
 pub mod plot;
 pub mod render;
 pub mod sheets;
+pub mod shx;
