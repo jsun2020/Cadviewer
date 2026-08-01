@@ -11,11 +11,19 @@ eframe = { version = "0.35.0", default-features = false, features = ["default_fo
 encoding_rs = "0.8"
 flate2 = "1"
 pdf-writer = "0.12"
+# Decodes the window icon at startup. Already in the tree transitively, so
+# naming it directly costs no extra build.
+png = "0.17"
 rfd = "0.17.2"
 subsetter = "0.2"
 tempfile = "3.27.0"
 tiny-skia = "0.11"
 ttf-parser = "0.25"
+
+[build-dependencies]
+# Embeds assets\app-icon.ico into the exe as a Win32 resource, which is what
+# Explorer, the taskbar and Alt+Tab read. Locates rc.exe/llvm-rc itself.
+embed-resource = "3"
 
 [profile.release]
 codegen-units = 1

@@ -52,6 +52,9 @@ if (Test-Path -LiteralPath $SourceStage) {
 New-Item -ItemType Directory -Force -Path $SourceStage | Out-Null
 Copy-Item -Recurse -LiteralPath (Join-Path $ProjectRoot 'src') -Destination $SourceStage
 Copy-Item -Recurse -LiteralPath (Join-Path $ProjectRoot 'scripts') -Destination $SourceStage
+# build.rs asserts the .ico is present and src\icon.rs include_bytes! the
+# PNG, so a source zip without assets\ cannot be built at all.
+Copy-Item -Recurse -LiteralPath (Join-Path $ProjectRoot 'assets') -Destination $SourceStage
 # build.rs stamps the binary with its revision; omitting it from the source
 # zip would make the shipped source fail to build at all.
 foreach ($File in 'Cargo.toml','Cargo.lock','build.rs','README.md','THIRD_PARTY_NOTICES.md','LICENSE') {
@@ -83,6 +86,45 @@ function Assert-NoFonts([string]$Root, [string]$What) {
         throw "The font leak gate did not fire on a planted .shx in ${What}; the check is vacuous."
     }
 }
+
+# The exe's icon is a Win32 resource added by build.rs. It is invisible to
+# every other check -- the program runs perfectly without it -- so assert the
+# artifact carries it rather than trusting that the build step ran.
+function Assert-IconEmbedded([string]$Exe, [string]$ControlFile) {
+    $Ico = Join-Path $ProjectRoot 'assets\app-icon.ico'
+    $Bytes = [System.IO.File]::ReadAllBytes($Ico)
+    $Count = [BitConverter]::ToUInt16($Bytes, 4)
+    $Needle = $null
+    for ($i = 0; $i -lt $Count; $i++) {
+        $Entry = 6 + $i * 16
+        $Width = $Bytes[$Entry]
+        if ($Width -ne 0) { continue }   # 0 encodes 256 in an icon directory
+        $Size = [BitConverter]::ToUInt32($Bytes, $Entry + 8)
+        $Offset = [BitConverter]::ToUInt32($Bytes, $Entry + 12)
+        $Needle = New-Object byte[] $Size
+        [Array]::Copy($Bytes, $Offset, $Needle, 0, $Size)
+    }
+    if (-not $Needle) { throw "assets\app-icon.ico has no 256x256 image to look for" }
+
+    # 28591 = ISO-8859-1, the only byte-preserving encoding available in
+    # Windows PowerShell 5.1; ::Latin1 is .NET Core only and yields $null,
+    # which would turn every comparison below into a silent false negative.
+    $Encoding = [System.Text.Encoding]::GetEncoding(28591)
+    $Pattern = $Encoding.GetString($Needle)
+    $Search = { param($Path) $Encoding.GetString([System.IO.File]::ReadAllBytes($Path)).IndexOf($Pattern) -ge 0 }
+
+    # Control assertion: a third-party binary must NOT match, or the search
+    # is matching something other than our icon.
+    if (& $Search $ControlFile) {
+        throw "The icon check matched ${ControlFile}, which carries no icon of ours; the check is not discriminating."
+    }
+    if (-not (& $Search $Exe)) {
+        throw "No application icon embedded in ${Exe}."
+    }
+}
+
+Assert-IconEmbedded (Join-Path $PackageDir 'Cadviewer.exe') (Join-Path $PackageDir 'runtime\dwg2dxf.exe')
+Assert-IconEmbedded (Join-Path $PackageDir 'Cadconvert.exe') (Join-Path $PackageDir 'runtime\dwg2dxf.exe')
 
 # Checked before each archive is written, not after: a gate that throws once
 # the zip already exists leaves the leaking artifact sitting on disk.

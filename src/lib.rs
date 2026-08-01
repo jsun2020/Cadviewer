@@ -5,6 +5,7 @@ pub mod doc;
 pub mod dxf;
 pub mod encoding;
 pub mod geom;
+pub mod icon;
 pub mod plot;
 pub mod render;
 pub mod sheets;

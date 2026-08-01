@@ -32,9 +32,21 @@ fn main() -> eframe::Result {
         .first()
         .map(PathBuf::from)
         .filter(|path| path.is_file());
+    // The embedded resource covers Explorer and the taskbar; the window
+    // itself has to be handed pixels. A malformed asset falls back to the
+    // platform default rather than preventing the window from opening.
+    let mut viewport = egui::ViewportBuilder::default();
+    if let Some(icon) = cadviewer::icon::app_icon() {
+        viewport = viewport.with_icon(egui::IconData {
+            rgba: icon.pixels,
+            width: icon.width,
+            height: icon.height,
+        });
+    }
+
     let native_options = eframe::NativeOptions {
         renderer: eframe::Renderer::Glow,
-        viewport: egui::ViewportBuilder::default()
+        viewport: viewport
             // R-DEPLOY: the title names the build, so "the fix is not in the
             // app I am running" is answerable without comparing timestamps.
             .with_title(format!("Cadviewer {}", cadviewer::build_info::stamp()))
