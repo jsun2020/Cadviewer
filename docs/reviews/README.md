@@ -24,6 +24,11 @@
 | PDF 图层（OCG） | 参考件默认带此能力，也是极好的逐层调试手段 | Phase 5 |
 | `BuildReport::skipped` 按全文档累计而非按页 | 每页显示相同的跳过计数，读起来有误导 | 任意阶段，成本很低 |
 | GUI 从未真机验证 | 无显示自动化环境；仅验证了 release 构建与转换器 | 需人工验证 |
+| 发版包内 zip 条目用反斜杠分隔 | `Compress-Archive` 在 Windows 上的行为，违反 ZIP APPNOTE 4.4.17.1；Explorer 与 `Expand-Archive` 均可正常解压 | 换用 `ZipFile::CreateFromDirectory` 可修，暂不改 |
+| 冒烟测试的对照断言 `catch` 未区分失败原因 | 任何失败都会被当作"对照生效"；实际很难误判——同一二进制与同一样例在数秒前刚成功过 | 可加异常消息匹配收紧 |
+| `verify-release.ps1` 里 `git status --porcelain` 未做保护 | 若机器上没有 git，脏树报错会被 "git 不是内部命令" 顶替，反而丢掉本来要给的信息 | 仅在 `+` 标记时触发，影响面窄 |
+| release job 未跑 clippy | clippy 回归不会阻断发版（CI 会拦，但发版流程本身不查） | 视需要加入 |
+| 工具链用浮动的 `@stable` | 发版构建不可跨时间复现；新 Rust 版本可能改变 lint 行为 | 需要复现性时钉死版本 |
 
 ## 本次重建中发现、但属于**既有代码**的缺陷
 
