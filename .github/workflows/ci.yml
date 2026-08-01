@@ -5,8 +5,12 @@ on:
     branches: ['**']
   pull_request:
 
+# Key on the PR number when this run is for a pull request: a push and its
+# open PR both build the same commit, but push events see github.ref as
+# refs/heads/<branch> while pull_request events see refs/pull/<n>/merge, so
+# keying on github.ref alone puts them in different groups and both run.
 concurrency:
-  group: ci-${{ github.ref }}
+  group: ci-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 jobs:
