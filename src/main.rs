@@ -35,7 +35,9 @@ fn main() -> eframe::Result {
     let native_options = eframe::NativeOptions {
         renderer: eframe::Renderer::Glow,
         viewport: egui::ViewportBuilder::default()
-            .with_title("Cadviewer")
+            // R-DEPLOY: the title names the build, so "the fix is not in the
+            // app I am running" is answerable without comparing timestamps.
+            .with_title(format!("Cadviewer {}", cadviewer::build_info::stamp()))
             .with_inner_size([1180.0, 760.0])
             .with_min_inner_size([720.0, 480.0])
             .with_drag_and_drop(true),
@@ -338,7 +340,11 @@ impl CadviewerApp {
                     self.loading = false;
                     match result {
                         Ok(document) => {
-                            let title = format!("{} — Cadviewer", file_name(&document.source));
+                            let title = format!(
+                                "{} — Cadviewer {}",
+                                file_name(&document.source),
+                                cadviewer::build_info::stamp()
+                            );
                             context.send_viewport_cmd(egui::ViewportCommand::Title(title));
                             self.generation += 1;
                             self.active_sheet = 0;

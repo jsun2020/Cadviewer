@@ -32,7 +32,9 @@ fn main() -> ExitCode {
 
     match convert_to_pdf(&PathBuf::from(input), &PathBuf::from(output), &options) {
         Ok((pages, warnings)) => {
-            println!("已导出 {pages} 页");
+            // Same purpose as the window title: name the build that produced
+            // this PDF, so a stale binary cannot be mistaken for a bad fix.
+            println!("已导出 {pages} 页（Cadviewer {}）", cadviewer::build_info::stamp());
             // R-TXT-2.3: a substituted font must never be invisible from the
             // command line — the page still exports, but not in the font the
             // drawing asked for.

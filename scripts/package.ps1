@@ -52,7 +52,9 @@ if (Test-Path -LiteralPath $SourceStage) {
 New-Item -ItemType Directory -Force -Path $SourceStage | Out-Null
 Copy-Item -Recurse -LiteralPath (Join-Path $ProjectRoot 'src') -Destination $SourceStage
 Copy-Item -Recurse -LiteralPath (Join-Path $ProjectRoot 'scripts') -Destination $SourceStage
-foreach ($File in 'Cargo.toml','Cargo.lock','README.md','THIRD_PARTY_NOTICES.md','LICENSE') {
+# build.rs stamps the binary with its revision; omitting it from the source
+# zip would make the shipped source fail to build at all.
+foreach ($File in 'Cargo.toml','Cargo.lock','build.rs','README.md','THIRD_PARTY_NOTICES.md','LICENSE') {
     Copy-Item -LiteralPath (Join-Path $ProjectRoot $File) -Destination $SourceStage
 }
 # R-TXT-5.3: SHX fonts are Autodesk/third-party licensed assets and TTFs are

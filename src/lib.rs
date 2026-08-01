@@ -1,5 +1,6 @@
 pub mod aci;
 pub mod converter;
+pub mod build_info;
 pub mod doc;
 pub mod dxf;
 pub mod encoding;
