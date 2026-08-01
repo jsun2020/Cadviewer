@@ -1,7 +1,10 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)][string]$Tag,
-    [Parameter(Mandatory = $true)][string]$ConvertExe
+    [Parameter(Mandatory = $true)][string]$ConvertExe,
+    # Optional so this script still runs stand-alone (e.g. a developer
+    # checking a local build); the release workflow always supplies it.
+    [string]$CommitSha
 )
 
 $ErrorActionPreference = 'Stop'
@@ -34,12 +37,33 @@ $Reported = (& $ConvertExe --version | Out-String).Trim()
 if ($LASTEXITCODE -ne 0) {
     throw "'$ConvertExe --version' exited with $LASTEXITCODE"
 }
-$Expected = "Cadviewer $ManifestVersion "
-if (-not $Reported.StartsWith($Expected)) {
-    throw "$ConvertExe reports '$Reported', which does not start with '$Expected'."
+
+# A version-only check cannot catch the exact incident this guard exists to
+# prevent: a binary built from a *different* commit at the *same* version
+# (e.g. a rebuild that never ran, still reporting the previous, still
+# matching, version). Requiring the shape "Cadviewer <version> (<hex>)"
+# rejects that by construction along with the two other bad shapes: a
+# missing revision ("(unknown)", the normal case for a source-zip build with
+# no .git) and a dirty build (build.rs appends "+" to the revision). The
+# version must be regex-escaped before it is interpolated -- it is a dotted
+# string ("0.1.0"), and an unescaped "." matches any character.
+$EscapedVersion = [regex]::Escape($ManifestVersion)
+$StampMatch = [regex]::Match($Reported, "^Cadviewer $EscapedVersion \(([0-9a-f]{7,})\)$")
+if (-not $StampMatch.Success) {
+    if ($Reported -match '\+\)$') {
+        throw "$ConvertExe was built from a dirty working tree ('$Reported'); a release must correspond to a commit."
+    }
+    throw "$ConvertExe reports '$Reported', which does not match 'Cadviewer $ManifestVersion (<commit>)'. A missing or dirty revision must not pass."
 }
-if ($Reported -match '\+\)$') {
-    throw "$ConvertExe was built from a dirty working tree ('$Reported'); a release must correspond to a commit."
+
+# Independent of the two text-file checks above: ties the binary to the
+# exact commit this workflow run checked out, not merely to a version
+# string that could have been carried over from a stale build.
+if ($PSBoundParameters.ContainsKey('CommitSha')) {
+    $ReportedRevision = $StampMatch.Groups[1].Value
+    if (-not $CommitSha.StartsWith($ReportedRevision, [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw "$ConvertExe reports commit '$ReportedRevision', which is not a prefix of this run's commit '$CommitSha'. The binary was not built from the commit being released."
+    }
 }
 
 Write-Host "Version agreed: tag $Tag, Cargo.toml $ManifestVersion, binary '$Reported'"

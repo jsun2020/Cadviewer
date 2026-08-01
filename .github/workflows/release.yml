@@ -35,6 +35,7 @@ jobs:
           .\scripts\verify-release.ps1
           -Tag "${{ github.ref_name }}"
           -ConvertExe ".\dist\Cadviewer-portable-win64\Cadconvert.exe"
+          -CommitSha "${{ github.sha }}"
 
       - name: Smoke test the packaged zip
         run: >
