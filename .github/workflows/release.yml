@@ -32,10 +32,19 @@ jobs:
       # Downloads the LibreDWG runtime and its corresponding source, both
       # SHA-256 pinned, then builds, stages, gates and zips. The same script
       # a developer runs locally, so the release cannot drift from it.
+      #
+      # shell: powershell -- GitHub's Windows runners default `run:` steps
+      # to pwsh 7, not the Windows PowerShell 5.1 every script under
+      # scripts/ was written and verified against (e.g. Add-Type's .NET
+      # Framework-era assembly names, ISO-8859-1 via GetEncoding(28591)).
+      # Pin the engine these scripts actually target rather than the
+      # runner's default (N1).
       - name: Package
+        shell: powershell
         run: .\scripts\package.ps1
 
       - name: Verify the version the artifact reports
+        shell: powershell
         run: >
           .\scripts\verify-release.ps1
           -Tag "${{ github.ref_name }}"
@@ -43,12 +52,14 @@ jobs:
           -CommitSha "${{ github.sha }}"
 
       - name: Smoke test the packaged zip
+        shell: powershell
         run: >
           .\scripts\smoke-test.ps1
           -Zip ".\dist\Cadviewer-portable-win64.zip"
           -SourceArchive ".\third_party\libredwg-0.14.tar.xz"
 
       - name: Checksum
+        shell: powershell
         run: |
           $Hash = (Get-FileHash -Algorithm SHA256 .\dist\Cadviewer-portable-win64.zip).Hash.ToLowerInvariant()
           # Set-Content -Encoding ASCII appends a CRLF line ending, which

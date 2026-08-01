@@ -143,7 +143,15 @@ with tarfile.open(sys.argv[1]) as archive:
         # must say so loudly rather than report a pass.
         $CrippledZip = Join-Path $Sandbox 'crippled.zip'
         Copy-Item -LiteralPath $Zip -Destination $CrippledZip
-        Add-Type -AssemblyName System.IO.Compression.FileSystem
+        # System.IO.Compression.FileSystem is a .NET Framework-era assembly
+        # name. This script is written for and verified under Windows
+        # PowerShell 5.1 (release.yml pins `shell: powershell` for exactly
+        # this reason), but if it is ever run under pwsh 7 the type already
+        # resolves without loading anything -- Add-Type then errors on the
+        # unneeded load, which $ErrorActionPreference = 'Stop' would
+        # otherwise turn into a misleading terminating failure here rather
+        # than a clear type-not-found error at the point of actual use.
+        try { Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction Stop } catch { }
         $Archive = [System.IO.Compression.ZipFile]::Open($CrippledZip, [System.IO.Compression.ZipArchiveMode]::Update)
         try {
             $RuntimeEntries = @($Archive.Entries | Where-Object { $_.FullName -match '[\\/]runtime[\\/]' })
