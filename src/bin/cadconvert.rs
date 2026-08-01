@@ -5,23 +5,41 @@ use cadviewer::converter::{ConvertOptions, convert_to_pdf};
 use cadviewer::plot::style::ColorMode;
 
 const USAGE: &str =
-    "用法：Cadconvert.exe <input.dwg|dxf> <output.pdf> [--mono] [--all|--sheet N] [--font-dir <path>]";
+    "用法：Cadconvert.exe <input.dwg|dxf> <output.pdf> [--mono] [--all|--sheet N] [--font-dir <path>]\n      Cadconvert.exe --version";
 
 /// R-CLI exit codes: 1 input error, 2 decode failure, 3 nothing to print.
 const EXIT_INPUT: u8 = 1;
 
+/// Whether the caller asked for the version rather than a conversion.
+///
+/// Checked before the input and output arguments are demanded, so
+/// `Cadconvert.exe --version` is not a usage error.
+fn wants_version(args: &[std::ffi::OsString]) -> bool {
+    args.iter().any(|arg| {
+        let arg = arg.to_string_lossy();
+        arg == "--version" || arg == "-V"
+    })
+}
+
 fn main() -> ExitCode {
-    let mut args = std::env::args_os().skip(1);
-    let Some(input) = args.next() else {
+    let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+    if wants_version(&args) {
+        println!("Cadviewer {}", cadviewer::build_info::stamp());
+        return ExitCode::SUCCESS;
+    }
+    let Some(input) = args.first() else {
         eprintln!("{USAGE}");
         return ExitCode::from(EXIT_INPUT);
     };
-    let Some(output) = args.next() else {
+    let Some(output) = args.get(1) else {
         eprintln!("{USAGE}");
         return ExitCode::from(EXIT_INPUT);
     };
 
-    let rest: Vec<String> = args.map(|a| a.to_string_lossy().into_owned()).collect();
+    let rest: Vec<String> = args[2..]
+        .iter()
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect();
     let options = match parse_options(&rest) {
         Ok(options) => options,
         Err(message) => {
@@ -92,6 +110,26 @@ mod tests {
 
     fn args(values: &[&str]) -> Vec<String> {
         values.iter().map(|v| (*v).to_owned()).collect()
+    }
+
+    fn os(value: &str) -> std::ffi::OsString {
+        std::ffi::OsString::from(value)
+    }
+
+    /// `--version` must be recognised before the input/output arguments are
+    /// required, or `Cadconvert.exe --version` fails as a usage error.
+    #[test]
+    fn a_version_request_is_recognised_anywhere_in_the_arguments() {
+        assert!(wants_version(&[os("--version")]));
+        assert!(wants_version(&[os("-V")]));
+        assert!(wants_version(&[os("in.dwg"), os("out.pdf"), os("--version")]));
+    }
+
+    #[test]
+    fn an_ordinary_conversion_is_not_a_version_request() {
+        assert!(!wants_version(&[os("in.dwg"), os("out.pdf")]));
+        assert!(!wants_version(&[os("in.dwg"), os("out.pdf"), os("--mono")]));
+        assert!(!wants_version(&[]));
     }
 
     #[test]
