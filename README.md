@@ -62,6 +62,17 @@ TrueType 绘制的文字在导出的 PDF 里是**真正的文字**：只把用�
   性能优化属后续阶段。
 - 图幅由图框尺寸按 A 系列 fit 推导，可能与 AutoCAD 当时选用的纸张不同（几何等价）。
 
+## 下载
+
+[**下载最新便携版**](https://github.com/jsun2020/Cadviewer/releases/latest)
+— 解压 `Cadviewer-portable-win64.zip` 后直接运行 `Cadviewer.exe`，无需安装，
+不写注册表。同页的 `.sha256` 可校验下载完整性。
+
+首次运行时 Windows SmartScreen 可能提示未知发布者：本程序未做代码签名。
+
+压缩包内已包含 DWG 解码所需的 LibreDWG 运行时；**不含任何字库**，
+文字使用机器上已安装的 SHX / TrueType 字库绘制。
+
 ## 开发与构建
 
 需要 Rust stable（MSVC target）：
