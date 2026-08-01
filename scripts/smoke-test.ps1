@@ -6,6 +6,14 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
+# Resolved to absolute paths before anything below changes directory. The
+# workflow passes these caller-relative (".\dist\..."), and the conversions
+# further down deliberately run with the sandbox as the working directory
+# (see the Push-Location further down) -- a relative path would then resolve
+# against the wrong root instead of failing loudly.
+$Zip = (Resolve-Path -LiteralPath $Zip).Path
+$SourceArchive = (Resolve-Path -LiteralPath $SourceArchive).Path
+
 # The whole point is to test what a user downloads, in a place that has none
 # of the build tree around it. A binary run from target\release can resolve a
 # DLL that a downloaded copy cannot (LL-033).
@@ -62,8 +70,8 @@ with tarfile.open(sys.argv[1]) as archive:
     # NOT named $Input/$Output: $input is a PowerShell automatic variable
     # (the pipeline enumerator), and shadowing it inside a function is the
     # same class of silent breakage as the $Version aliasing in LL-032.
-    function Get-PdfInk([string]$InputPath, [string]$OutputPath, [string]$What) {
-        & $Convert $InputPath $OutputPath | Out-Null
+    function Get-PdfInk([string]$InputPath, [string]$OutputPath, [string]$What, [string]$ConvertPath = $Convert) {
+        & $ConvertPath $InputPath $OutputPath | Out-Null
         if ($LASTEXITCODE -ne 0) { throw "converting $What exited with $LASTEXITCODE" }
         if (-not (Test-Path -LiteralPath $OutputPath)) { throw "no PDF produced for $What" }
         $Bytes = [System.IO.File]::ReadAllBytes($OutputPath)
@@ -103,17 +111,75 @@ with tarfile.open(sys.argv[1]) as archive:
         return [int]$StreamMatch.Groups[1].Value
     }
 
-    $EmptyInk = Get-PdfInk $EmptyDxf (Join-Path $Sandbox 'empty.pdf') 'the empty control drawing'
-    $RealInk = Get-PdfInk $Fixture (Join-Path $Sandbox 'fixture.pdf') 'the DWG fixture'
+    # locate_converter() (src/converter.rs) falls back to
+    # current_dir()\runtime\dwg2dxf.exe when it finds no runtime\ beside the
+    # exe itself. Left at the caller's working directory -- the repository
+    # root in CI, where prepare-libredwg.ps1 has just staged
+    # runtime\dwg2dxf.exe for the build -- that fallback would quietly
+    # resolve to the BUILD TREE's runtime, and this script would pass even
+    # for a zip that ships no runtime\ folder at all (demonstrated: deleting
+    # both runtime\ entries from the real package zip still passed this
+    # script from the repository root). Moving into the sandbox removes that
+    # accidental target. Pop-Location lives in `finally` so it always runs,
+    # including when a conversion throws.
+    Push-Location $Sandbox
+    try {
+        $EmptyInk = Get-PdfInk $EmptyDxf (Join-Path $Sandbox 'empty.pdf') 'the empty control drawing'
+        $RealInk = Get-PdfInk $Fixture (Join-Path $Sandbox 'fixture.pdf') 'the DWG fixture'
 
-    Write-Host "content stream: empty control $EmptyInk bytes, real drawing $RealInk bytes"
-    # Measured on 2026-08-01: 64 for an empty page, 660 for this fixture.
-    # Comparing against the control rather than a constant means the check
-    # keeps working when the PDF writer's output changes.
-    if ($RealInk -le $EmptyInk * 3) {
-        throw "The DWG converted to an essentially blank page ($RealInk vs $EmptyInk); the drawing was not rendered."
+        Write-Host "content stream: empty control $EmptyInk bytes, real drawing $RealInk bytes"
+        # Measured on 2026-08-01: 64 for an empty page, 660 for this fixture.
+        # Comparing against the control rather than a constant means the check
+        # keeps working when the PDF writer's output changes.
+        if ($RealInk -le $EmptyInk * 3) {
+            throw "The DWG converted to an essentially blank page ($RealInk vs $EmptyInk); the drawing was not rendered."
+        }
+
+        # Control assertion: a gate that would pass no matter what the zip
+        # contains is not a gate. Cripple a COPY of the real zip (the
+        # original is never touched) by deleting its runtime\ entries, and
+        # require the same conversion to fail against it. If it still
+        # succeeds, this script is not testing the packaged runtime and
+        # must say so loudly rather than report a pass.
+        $CrippledZip = Join-Path $Sandbox 'crippled.zip'
+        Copy-Item -LiteralPath $Zip -Destination $CrippledZip
+        Add-Type -AssemblyName System.IO.Compression.FileSystem
+        $Archive = [System.IO.Compression.ZipFile]::Open($CrippledZip, [System.IO.Compression.ZipArchiveMode]::Update)
+        try {
+            $RuntimeEntries = @($Archive.Entries | Where-Object { $_.FullName -match '[\\/]runtime[\\/]' })
+            if ($RuntimeEntries.Count -eq 0) {
+                throw "no runtime\ entries found in the zip; the control assertion cannot cripple it"
+            }
+            foreach ($Entry in $RuntimeEntries) { $Entry.Delete() }
+        }
+        finally {
+            $Archive.Dispose()
+        }
+
+        $CrippledDir = Join-Path $Sandbox 'crippled'
+        Expand-Archive -LiteralPath $CrippledZip -DestinationPath $CrippledDir
+        $CrippledConvert = Join-Path $CrippledDir 'Cadviewer-portable-win64\Cadconvert.exe'
+        if (-not (Test-Path -LiteralPath $CrippledConvert)) {
+            throw "the crippled copy did not extract Cadconvert.exe; the control assertion is broken"
+        }
+
+        $ControlFailed = $false
+        try {
+            Get-PdfInk $Fixture (Join-Path $Sandbox 'control.pdf') 'the control conversion (runtime-less zip)' -ConvertPath $CrippledConvert | Out-Null
+        }
+        catch {
+            $ControlFailed = $true
+            Write-Host "Control assertion: a zip with no runtime\ correctly failed to convert ($($_.Exception.Message))"
+        }
+        if (-not $ControlFailed) {
+            throw "The smoke test passed against a zip with runtime\ removed; the gate is not testing the packaged runtime (C1)."
+        }
+
+        Write-Host "Smoke test passed: the packaged binary converted a real DWG from a fresh directory, and the control assertion proved the gate actually discriminates."
     }
-    Write-Host "Smoke test passed: the packaged binary converted a real DWG from a fresh directory."
+    finally {
+        Pop-Location
+    }
 }
 finally {
     if ($null -ne $SavedLibredwgEnv) {
