@@ -175,6 +175,16 @@ with tarfile.open(sys.argv[1]) as archive:
             throw "The smoke test passed against a zip with runtime\ removed; the gate is not testing the packaged runtime (C1)."
         }
 
+        # The control assertion's whole point is a failing native process,
+        # which leaves $LASTEXITCODE non-zero. GitHub Actions' pwsh/
+        # powershell step wrapper exits the step with $LASTEXITCODE if it is
+        # still non-zero when the script ends -- without this reset, a
+        # PASSING run of this script would still fail the CI step. Must be
+        # $global: -- a script invoked with `&`/by path runs in its own
+        # scope, so a bare `$LASTEXITCODE = 0` only shadows the variable
+        # there and never reaches the caller's copy that CI inspects.
+        $global:LASTEXITCODE = 0
+
         Write-Host "Smoke test passed: the packaged binary converted a real DWG from a fresh directory, and the control assertion proved the gate actually discriminates."
     }
     finally {
