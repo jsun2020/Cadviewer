@@ -67,8 +67,32 @@ if (-not $StampMatch.Success) {
 # string that could have been carried over from a stale build.
 if ($PSBoundParameters.ContainsKey('CommitSha')) {
     $ReportedRevision = $StampMatch.Groups[1].Value
-    if (-not $CommitSha.StartsWith($ReportedRevision, [System.StringComparison]::OrdinalIgnoreCase)) {
-        throw "$ConvertExe reports commit '$ReportedRevision', which is not a prefix of this run's commit '$CommitSha'. The binary was not built from the commit being released."
+
+    # github.sha can be an ANNOTATED tag object's own SHA rather than the
+    # commit it points at -- those differ, and comparing against the tag
+    # object would fail a genuinely correct build with a message that reads
+    # exactly like real staleness. Dereference to the underlying commit
+    # first. This is a defensive step, not a new gate: if `git rev-parse`
+    # is unavailable or the ref does not resolve, fall back to comparing
+    # against the raw value rather than throwing here.
+    $ResolvedCommitSha = $CommitSha
+    $PreviousEap = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $Dereferenced = (& git -C $ProjectRoot rev-parse "$CommitSha^{commit}" 2>$null | Out-String).Trim()
+        if ($LASTEXITCODE -eq 0 -and $Dereferenced) {
+            $ResolvedCommitSha = $Dereferenced
+        }
+    }
+    catch {
+        # Fall through with the raw $CommitSha -- see comment above.
+    }
+    finally {
+        $ErrorActionPreference = $PreviousEap
+    }
+
+    if (-not $ResolvedCommitSha.StartsWith($ReportedRevision, [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw "$ConvertExe reports commit '$ReportedRevision', which is not a prefix of this run's commit '$ResolvedCommitSha'. The binary was not built from the commit being released."
     }
 }
 
