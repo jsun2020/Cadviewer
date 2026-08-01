@@ -152,6 +152,15 @@ Expected: one line like `Cadviewer 0.1.0 (<hash>)`, exit code 0.
 
 - [ ] **Step 6: Write `scripts/verify-release.ps1`**
 
+> **SUPERSEDED.** The body below is the pre-fix version. The final review
+> found it could not detect a binary built from a different commit at the
+> same version, and did not reject a missing/dirty revision by shape. The
+> shipped `scripts/verify-release.ps1` is authoritative: it requires the
+> stamp to match `Cadviewer <version> (<hex commit>)`, takes an optional
+> `-CommitSha` compared against the reported revision, and dereferences an
+> annotated tag's object SHA to its commit before comparing. Do not
+> regenerate this script from the block below.
+
 ```powershell
 [CmdletBinding()]
 param(
@@ -244,6 +253,18 @@ git commit -m "feat(cli): --version, and a release guard the artifact must satis
 - Produces: `scripts/smoke-test.ps1 -Zip <path> -SourceArchive <path>` exiting non-zero unless the extracted binary converts a real DWG into a PDF that actually contains drawing.
 
 - [ ] **Step 1: Write `scripts/smoke-test.ps1`**
+
+> **SUPERSEDED.** The body below is the pre-fix version, and it does NOT
+> test the packaged runtime: `locate_converter()` (`src/converter.rs`)
+> falls back to `current_dir()\runtime\dwg2dxf.exe`, and this script never
+> changes directory, so when run from the repository root (as `release.yml`
+> does) that fallback silently resolves to the BUILD TREE's `runtime\`
+> instead of the extracted zip's. A zip shipping no `runtime\` folder at all
+> passed this version of the script. The shipped `scripts/smoke-test.ps1` is
+> authoritative: it resolves its paths to absolute before running, moves
+> into the extraction sandbox for every conversion, and adds a control
+> assertion that cripples a copy of the zip and requires the conversion to
+> fail against it. Do not regenerate this script from the block below.
 
 ```powershell
 [CmdletBinding()]
