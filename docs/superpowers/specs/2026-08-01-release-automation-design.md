@@ -82,26 +82,50 @@ This is the part that justifies the whole design. It runs against the
 the build tree:
 
 1. Expand `Cadviewer-portable-win64.zip` to a temp path.
-2. Write a small ASCII DXF fixture. No customer data ever reaches CI.
-3. Convert that fixture to `.dwg` using `dxf2dwg.exe` from the LibreDWG
-   bundle already downloaded by `prepare-libredwg.ps1`.
-4. Run the **extracted** `Cadconvert.exe` against the `.dwg`.
-5. Assert exit code 0, and that the output begins with `%PDF-` and contains
-   a page object.
+2. Obtain a real `.dwg` fixture (see "DWG fixture" below) and a small ASCII
+   DXF fixture with no entities, as the control. No customer data ever
+   reaches CI.
+3. Run the **extracted** `Cadconvert.exe`, with the working directory moved
+   into the extraction sandbox, against both fixtures.
+4. Assert exit code 0 for each, that each output begins with `%PDF-` and
+   contains a resolvable `/Type /Page` object, and that the DWG's page
+   content stream is substantially larger than the empty control's — not
+   merely present, since a zero-entity conversion still produces a
+   structurally valid, empty PDF page (see "DWG fixture" below).
+5. As a control assertion, cripple a *copy* of the zip by deleting its
+   `runtime\` entries and require the same conversion to fail against it. A
+   smoke test that would pass no matter what the zip contains proves
+   nothing; this is what makes the pass in step 4 meaningful.
 
-Step 3 is not optional decoration. A DXF input never invokes `dwg2dxf.exe`
-or `libredwg-0.dll` at all, so a DXF-only smoke test passes with an empty
-`runtime\` folder — it would prove nothing about the packaged runtime. Step
-1 matters for the same reason: running from the build tree can resolve a
-DLL that a downloaded copy cannot (the relocation blindness of LL-033).
+Step 3's working-directory move is not optional. `locate_converter()`
+(`src/converter.rs`) falls back to `current_dir()\runtime\dwg2dxf.exe` when
+it finds no `runtime\` beside the exe; left at the caller's directory — the
+repository root in CI, where `prepare-libredwg.ps1` has just staged that
+same path for the build — that fallback silently resolves to the **build
+tree's** runtime, and the test would pass even for a zip shipping no
+`runtime\` folder at all. This was demonstrated directly: with the
+`runtime\` entries deleted from the real package zip, an earlier version of
+this script passed when run from the repository root and only failed when
+run from an empty directory. Step 5 exists so that failure mode cannot
+recur silently.
 
-Step 5 checks magic bytes rather than existence or size, because a zero-page
-or HTML-shaped file passes both weaker checks (LL-005).
+**DWG fixture.** The original plan was to convert the ASCII DXF fixture to
+`.dwg` with `dxf2dwg.exe` from the LibreDWG bundle. Measured directly: that
+round-trip produces a DWG with **zero entities** — LibreDWG's DWG writer is
+its least mature component — which renders as a structurally valid but
+empty PDF page and would make the smoke test pass against a build that
+cannot draw anything. The DWG fixture actually shipped is instead
+`libredwg-0.14/test/test-data/example_2004.dwg`, lifted from the source
+archive already downloaded and SHA-256-pinned for the GPL corresponding-source
+offer — LibreDWG's own GPL test data, so no customer drawing is ever
+involved, and it exercises `dwg2dxf.exe`/`libredwg-0.dll` for real (5
+drawings, page content stream of 660 bytes, versus 64 for the empty
+control). This is better than the originally planned fallback of dropping to
+a DXF-only test, which would never load the LibreDWG runtime at all.
 
-**If the `dxf2dwg` round-trip proves unreliable**, the fallback is a
-DXF-only smoke test *plus an explicit statement in the workflow log and in
-this document* that the DWG path is unverified. Silently degrading to the
-weaker check is not an acceptable outcome.
+Magic bytes and a resolvable page object are checked rather than existence
+or size, because a zero-page or HTML-shaped file passes both weaker checks
+(LL-005).
 
 ## Existing gates, kept
 
