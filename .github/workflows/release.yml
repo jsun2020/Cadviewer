@@ -51,7 +51,11 @@ jobs:
       - name: Checksum
         run: |
           $Hash = (Get-FileHash -Algorithm SHA256 .\dist\Cadviewer-portable-win64.zip).Hash.ToLowerInvariant()
-          "$Hash  Cadviewer-portable-win64.zip" | Set-Content -Encoding ASCII .\dist\Cadviewer-portable-win64.zip.sha256
+          # Set-Content -Encoding ASCII appends a CRLF line ending, which
+          # sha256sum -c rejects ("no properly formatted checksum lines
+          # found"). Write the bytes directly with an explicit LF instead.
+          $ShaPath = [System.IO.Path]::GetFullPath(".\dist\Cadviewer-portable-win64.zip.sha256")
+          [System.IO.File]::WriteAllText($ShaPath, "$Hash  Cadviewer-portable-win64.zip`n")
           Write-Host $Hash
 
       - name: Publish
