@@ -11,6 +11,13 @@ $ErrorActionPreference = 'Stop'
 # DLL that a downloaded copy cannot (LL-033).
 $Sandbox = Join-Path ([System.IO.Path]::GetTempPath()) ("cadviewer-smoke-" + [System.Guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Force -Path $Sandbox | Out-Null
+
+# locate_converter() in src/converter.rs checks CADVIEWER_LIBREDWG before it
+# ever looks in runtime\. If that variable happens to be set in this
+# session, Cadconvert.exe would silently validate a LibreDWG outside the
+# extracted zip, and this script would stop testing what a user downloads.
+$SavedLibredwgEnv = $env:CADVIEWER_LIBREDWG
+Remove-Item Env:\CADVIEWER_LIBREDWG -ErrorAction SilentlyContinue
 try {
     Expand-Archive -LiteralPath $Zip -DestinationPath $Sandbox
     $Convert = Join-Path $Sandbox 'Cadviewer-portable-win64\Cadconvert.exe'
@@ -65,11 +72,35 @@ with tarfile.open(sys.argv[1]) as archive:
         $Text = [System.Text.Encoding]::GetEncoding(28591).GetString($Bytes)
         if (-not $Text.StartsWith('%PDF-')) { throw "$What did not produce PDF magic bytes" }
         if ($Text.IndexOf('%%EOF') -lt 0) { throw "$What produced a truncated PDF" }
-        if ($Text.IndexOf('/Type /Page') -lt 0) { throw "$What produced a PDF with no page object" }
-        $Lengths = [regex]::Matches($Text, '/Length\s+(\d+)') |
-            ForEach-Object { [int]$_.Groups[1].Value }
-        if (-not $Lengths) { throw "$What produced a PDF with no content stream" }
-        return ($Lengths | Measure-Object -Maximum).Maximum
+
+        # Measure the PAGE's content stream specifically, not the largest
+        # /Length in the whole file. This project embeds TrueType font
+        # subsets as separate FontFile2 objects with their own /Length,
+        # which can run to kilobytes; a document-wide maximum would
+        # silently start measuring embedded font data instead of drawn
+        # ink the moment a fixture contains text, and a gate that stops
+        # discriminating without anyone noticing is exactly the failure
+        # mode this project has already shipped twice (see CLAUDE.md
+        # Lessons Learned). Object headers are anchored at line start and
+        # names need no space before another name (a bare '/' already
+        # ends the token), so '/Type/Page' and '/Type /Page' both match.
+        $Options = [System.Text.RegularExpressions.RegexOptions]'Singleline, Multiline'
+        $PageMatch = [regex]::Match(
+            $Text,
+            '^\d+\s+0\s+obj\s*<<(?:(?!endobj).)*?/Type\s*/Page(?!s)(?:(?!endobj).)*?/Contents\s+(\d+)\s+0\s+R',
+            $Options)
+        if (-not $PageMatch.Success) {
+            throw "$What has no /Type /Page object with a resolvable /Contents reference"
+        }
+        $ContentsObj = $PageMatch.Groups[1].Value
+        $StreamMatch = [regex]::Match(
+            $Text,
+            "^$ContentsObj\s+0\s+obj\s*<<(?:(?!endobj).)*?/Length\s+(\d+)",
+            $Options)
+        if (-not $StreamMatch.Success) {
+            throw "$What's page /Contents points at object $ContentsObj, which has no resolvable /Length"
+        }
+        return [int]$StreamMatch.Groups[1].Value
     }
 
     $EmptyInk = Get-PdfInk $EmptyDxf (Join-Path $Sandbox 'empty.pdf') 'the empty control drawing'
@@ -85,5 +116,8 @@ with tarfile.open(sys.argv[1]) as archive:
     Write-Host "Smoke test passed: the packaged binary converted a real DWG from a fresh directory."
 }
 finally {
+    if ($null -ne $SavedLibredwgEnv) {
+        $env:CADVIEWER_LIBREDWG = $SavedLibredwgEnv
+    }
     Remove-Item -Recurse -Force -LiteralPath $Sandbox -ErrorAction SilentlyContinue
 }
