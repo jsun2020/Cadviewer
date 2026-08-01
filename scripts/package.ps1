@@ -13,7 +13,11 @@ $SourceStage = Join-Path $env:TEMP 'Cadviewer-source-stage'
 if (-not $SkipBuild) {
     Push-Location $ProjectRoot
     try {
-        cargo build --release
+        # --locked: a Cargo.lock left stale by a Cargo.toml version bump
+        # fails here with cargo's own message about the lock file, instead
+        # of being silently regenerated and surfacing later as an unrelated
+        # "dirty working tree" error from verify-release.ps1 (I2).
+        cargo build --release --locked
         if ($LASTEXITCODE -ne 0) {
             throw "cargo build failed with exit code $LASTEXITCODE"
         }

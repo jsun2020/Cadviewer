@@ -37,5 +37,9 @@ jobs:
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings
 
+      # --locked: fail on a Cargo.lock that does not match Cargo.toml with
+      # cargo's own clear message, rather than letting cargo regenerate the
+      # lock file and leave the tree dirty for a later, unrelated-looking
+      # check to trip over (I2).
       - name: Tests
-        run: cargo test
+        run: cargo test --locked

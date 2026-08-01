@@ -20,9 +20,14 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
 
-      # Fails the release rather than shipping an untested build.
+      # Fails the release rather than shipping an untested build. --locked:
+      # a stale Cargo.lock (e.g. after a version bump in Cargo.toml) fails
+      # here with cargo's own clear message, instead of being silently
+      # regenerated and leaving the tree dirty for verify-release.ps1 to
+      # trip over later with a message that points nowhere near the cause
+      # (I2).
       - name: Tests
-        run: cargo test
+        run: cargo test --locked
 
       # Downloads the LibreDWG runtime and its corresponding source, both
       # SHA-256 pinned, then builds, stages, gates and zips. The same script

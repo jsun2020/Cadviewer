@@ -51,7 +51,13 @@ $EscapedVersion = [regex]::Escape($ManifestVersion)
 $StampMatch = [regex]::Match($Reported, "^Cadviewer $EscapedVersion \(([0-9a-f]{7,})\)$")
 if (-not $StampMatch.Success) {
     if ($Reported -match '\+\)$') {
-        throw "$ConvertExe was built from a dirty working tree ('$Reported'); a release must correspond to a commit."
+        # Name the offending file rather than leaving the developer to
+        # guess. The most common cause is Cargo.lock left stale after a
+        # version bump in Cargo.toml -- `cargo test`/`cargo build`
+        # regenerate it, build.rs then stamps "+", and without this the
+        # error points nowhere near that.
+        $GitStatus = (& git -C $ProjectRoot status --porcelain | Out-String).Trim()
+        throw "$ConvertExe was built from a dirty working tree ('$Reported'); a release must correspond to a commit. git status --porcelain:`n$GitStatus"
     }
     throw "$ConvertExe reports '$Reported', which does not match 'Cadviewer $ManifestVersion (<commit>)'. A missing or dirty revision must not pass."
 }
